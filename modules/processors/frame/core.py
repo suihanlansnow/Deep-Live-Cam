@@ -142,6 +142,7 @@ def process_video_in_memory(source_path: str, target_path: str, fps: float) -> b
     from modules import imread_unicode
     from modules.face_analyser import get_one_face
     from modules.utilities import (
+        _ffmpeg_has_encoder,
         get_video_dimensions,
         estimate_frame_count,
         get_temp_output_path,
@@ -213,6 +214,15 @@ def process_video_in_memory(source_path: str, target_path: str, fps: float) -> b
                 '-qp_i', str(modules.globals.video_quality),
                 '-qp_p', str(modules.globals.video_quality),
             ]
+
+    # Skip a doomed hardware attempt: if this ffmpeg build lacks the encoder,
+    # _run_pipe_pipeline would process the whole video before failing and the
+    # retry below would run the entire pass a second time.  Probe up front.
+    if is_hw_encoder and not _ffmpeg_has_encoder(encoder):
+        print(f"[DLC.CORE] {encoder} is not available in this ffmpeg build; "
+              f"using software encoding.")
+        encoder = modules.globals.video_encoder
+        is_hw_encoder = False
 
     if not is_hw_encoder:
         if encoder == 'libx264':
@@ -354,7 +364,9 @@ def _run_pipe_pipeline(
     # has fully consumed it.
     write_queue: queue.Queue = queue.Queue(maxsize=2)
     free_buffers: queue.Queue = queue.Queue()
-    for _ in range(3):
+    # Four buffers: one being filled by the reader thread, up to two in the
+    # read queue, and the rest recycling through the writer.
+    for _ in range(4):
         free_buffers.put(bytearray(frame_size))
 
     def _writer_loop() -> None:
@@ -382,6 +394,54 @@ def _run_pipe_pipeline(
         target=_writer_loop, name='DLC.VIDEO-WRITER', daemon=True
     )
     writer_thread.start()
+
+    # Decode-ahead thread.  A frame is 6 MB at 1080p but the OS pipe buffer is
+    # a few dozen KB, so ffmpeg cannot run ahead of us: reading inline made
+    # every frame wait for a full decode (8 ms at 1080p, 43 ms at 4K) with the
+    # GPU idle.  Buffers cycle free_buffers -> reader -> frame_queue -> main
+    # loop -> write_queue -> writer -> free_buffers, still zero-copy.
+    frame_queue: queue.Queue = queue.Queue(maxsize=2)
+    read_error: List[str] = []
+    reader_stop = threading.Event()
+
+    def _reader_loop() -> None:
+        try:
+            while not reader_stop.is_set():
+                buf = free_buffers.get()
+                if reader_stop.is_set():
+                    free_buffers.put(buf)
+                    return
+                read_mv = memoryview(buf)
+                total_read = 0
+                try:
+                    while total_read < frame_size:
+                        chunk = reader.stdout.readinto(read_mv[total_read:])
+                        if not chunk:
+                            break
+                        total_read += chunk
+                finally:
+                    read_mv.release()
+                if total_read != frame_size:
+                    free_buffers.put(buf)
+                    return
+                while not reader_stop.is_set():
+                    try:
+                        frame_queue.put((buf, total_read), timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as exc:
+            read_error.append(str(exc))
+        finally:
+            try:
+                frame_queue.put(None, timeout=1.0)
+            except queue.Full:
+                pass
+
+    reader_thread = threading.Thread(
+        target=_reader_loop, name='DLC.VIDEO-READER', daemon=True
+    )
+    reader_thread.start()
 
     bar_fmt = ('{l_bar}{bar}| {n_fmt}/{total_fmt} '
                '[{elapsed}<{remaining}, {rate_fmt}{postfix}]')
@@ -411,21 +471,13 @@ def _run_pipe_pipeline(
                 roi_detector = ROIDetector()
 
             while True:
-                # Read straight into a pooled buffer (no per-frame 6 MB
-                # bytes allocation + copy at 1080p).
-                read_buf = free_buffers.get()
-                read_mv = memoryview(read_buf)
-                total_read = 0
-                while total_read < frame_size:
-                    chunk = reader.stdout.readinto(read_mv[total_read:])
-                    if not chunk:
-                        break
-                    total_read += chunk
-                read_mv.release()
-                if total_read != frame_size:
-                    free_buffers.put(read_buf)
+                read_start = time.perf_counter() if prof.enabled else 0.0
+                item = frame_queue.get()
+                if item is None:
                     break
-
+                read_buf, _ = item
+                if prof.enabled:
+                    prof.add('read_wait', time.perf_counter() - read_start)
                 frame = np.frombuffer(read_buf, dtype=np.uint8).reshape(
                     (height, width, 3)
                 )
@@ -499,6 +551,9 @@ def _run_pipe_pipeline(
         writer.stdin.close()
         writer.wait()
         reader.wait()
+        reader_thread.join(timeout=5)
+        if read_error:
+            print(f"[DLC.CORE] Video reader error: {read_error[0]}")
 
         if writer.returncode != 0:
             stderr_out = writer.stderr.read().decode(errors='ignore').strip()
@@ -517,6 +572,7 @@ def _run_pipe_pipeline(
     finally:
         # If the loop exited abnormally the writer thread is still waiting on
         # the queue — release it before killing the FFmpeg processes it feeds.
+        reader_stop.set()
         if writer_thread is not None and writer_thread.is_alive():
             try:
                 write_queue.put(None, timeout=1)
@@ -539,3 +595,6 @@ def _run_pipe_pipeline(
                             pipe.close()
                         except Exception:
                             pass
+        # Killing the reader process above releases a blocked readinto().
+        if reader_thread is not None:
+            reader_thread.join(timeout=5)
