@@ -92,6 +92,19 @@ py run.py --frame-processor face_swapper face_enhancer
 py run.py --execution-provider cuda
 ```
 
+## 性能分析
+
+设置 `DLC_PROFILE=1` 后，Live 预览和视频处理会每 2 秒打印一次分段耗时：
+
+```powershell
+$env:DLC_PROFILE='1'; py run.py
+# [DLC.PROFILE:live] fps=29.8 frames=60 queue_wait=0.12ms detect=5.41ms swap=10.03ms
+# [DLC.PROFILE:display] fps=29.8 frames=60 display=1.42ms
+# [DLC.PROFILE:video] fps=48.2 frames=96 detect=6.10ms process=12.40ms write_wait=0.31ms
+```
+
+`queue_wait` 长时间接近 0 说明 GPU 是瓶颈；`write_wait` 偏高说明编码器跟不上。
+
 ## 致谢
 
 - [hacksider/Deep-Live-Cam](https://github.com/hacksider/Deep-Live-Cam) — 上游

@@ -3,7 +3,10 @@ import mimetypes
 import os
 import shutil
 import subprocess
+import threading
+import time
 import urllib
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Any
 from tqdm import tqdm
@@ -13,6 +16,68 @@ from modules.model_downloader import _ssl_context
 
 TEMP_FILE = "temp.mp4"
 TEMP_DIRECTORY = "temp"
+
+
+class StageProfiler:
+    """Opt-in per-stage timing, gated by the ``DLC_PROFILE=1`` env var.
+
+    Wrap the hot sections of a pipeline in ``with prof.stage("name"):`` and
+    call ``tick()`` once per produced frame.  Every two seconds it prints the
+    average milliseconds per stage plus the realized fps.  When the env var is
+    unset nothing is timed and nothing is printed, so the cost is a single
+    boolean check per stage.
+    """
+
+    WINDOW_S = 2.0
+
+    def __init__(self, label: str):
+        self.label = label
+        self.enabled = os.environ.get("DLC_PROFILE") == "1"
+        self._acc: dict = {}
+        self._frames = 0
+        self._window_start = time.perf_counter()
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def stage(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - start
+            with self._lock:
+                self._acc[name] = self._acc.get(name, 0.0) + elapsed
+
+    def add(self, name: str, seconds: float) -> None:
+        if self.enabled:
+            with self._lock:
+                self._acc[name] = self._acc.get(name, 0.0) + seconds
+
+    def tick(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._frames += 1
+            now = time.perf_counter()
+            elapsed = now - self._window_start
+            if elapsed < self.WINDOW_S:
+                return
+            parts = " ".join(
+                f"{name}={total / self._frames * 1000:.2f}ms"
+                for name, total in self._acc.items()
+            )
+            frames = self._frames
+            self._acc.clear()
+            self._frames = 0
+            self._window_start = now
+        print(
+            f"[DLC.PROFILE:{self.label}] fps={frames / elapsed:.1f} "
+            f"frames={frames} {parts}",
+            flush=True,
+        )
 
 
 def run_ffmpeg(args: List[str]) -> bool:

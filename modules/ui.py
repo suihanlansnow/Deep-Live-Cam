@@ -73,6 +73,7 @@ from modules.utilities import (
     has_image_extension,
     is_image,
     is_video,
+    StageProfiler,
 )
 from modules import imread_unicode
 from modules.video_capture import VideoCapturer
@@ -274,10 +275,17 @@ def fit_image_to_size(image, width: int, height: int):
 
 
 def _bgr_to_qpixmap(bgr: np.ndarray) -> QPixmap:
-    """Zero-copy BGR ndarray → QPixmap."""
+    """BGR ndarray → QPixmap without a channel swap or an extra copy.
+
+    Qt's Format_BGR888 consumes the BGR buffer directly, so the old
+    cvtColor(BGR→RGB) plus QImage.copy() pair — two full-frame copies per
+    displayed frame — is gone.  QPixmap.fromImage deep-copies, so the numpy
+    buffer can be released as soon as this returns.
+    """
+    if not bgr.flags["C_CONTIGUOUS"]:
+        bgr = np.ascontiguousarray(bgr)
     h, w = bgr.shape[:2]
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+    qimg = QImage(bgr.data, w, h, w * 3, QImage.Format.Format_BGR888)
     return QPixmap.fromImage(qimg)
 
 
@@ -1214,12 +1222,16 @@ class _ProcessingWorker(QThread):
         cached_target_face = None
         cached_many_faces = None
         det_interval = max(1, round(self._fps * 0.08))
+        prof = StageProfiler("live")
 
         while not self._stop.is_set():
+            queue_wait_start = time.perf_counter() if prof.enabled else 0.0
             try:
                 frame = self._cq.get(timeout=0.05)
             except queue.Empty:
                 continue
+            if prof.enabled:
+                prof.add("queue_wait", time.perf_counter() - queue_wait_start)
 
             temp_frame = frame
             if modules.globals.live_mirror:
@@ -1260,12 +1272,15 @@ class _ProcessingWorker(QThread):
 
                 det_count += 1
                 if det_count % det_interval == 0:
+                    detect_start = time.perf_counter() if prof.enabled else 0.0
                     if modules.globals.many_faces:
                         cached_target_face = None
                         cached_many_faces = detect_many_faces_fast(temp_frame)
                     else:
                         cached_target_face = detect_one_face_fast(temp_frame)
                         cached_many_faces = None
+                    if prof.enabled:
+                        prof.add("detect", time.perf_counter() - detect_start)
 
                 cached_faces = None
                 if cached_many_faces:
@@ -1296,6 +1311,7 @@ class _ProcessingWorker(QThread):
                                 None, temp_frame, detected_faces=cached_faces
                             )
                     elif fp.NAME == "DLC.FACE-SWAPPER":
+                        swap_start = time.perf_counter() if prof.enabled else 0.0
                         swapped_bboxes = []
                         if modules.globals.many_faces and cached_many_faces:
                             result = temp_frame.copy()
@@ -1321,6 +1337,8 @@ class _ProcessingWorker(QThread):
                             ):
                                 swapped_bboxes.append(cached_target_face.bbox.astype(int))
                         temp_frame = fp.apply_post_processing(temp_frame, swapped_bboxes)
+                        if prof.enabled:
+                            prof.add("swap", time.perf_counter() - swap_start)
                     else:
                         temp_frame = fp.process_frame(source_image, temp_frame)
 
@@ -1382,6 +1400,8 @@ class _ProcessingWorker(QThread):
                 except queue.Full:
                     pass
 
+            prof.tick()
+
         if async_swapper is not None:
             async_swapper.close()
 
@@ -1391,6 +1411,7 @@ class WebcamPreviewWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Live Preview")
         self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
+        self._prof = StageProfiler("display")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self._image_label = QLabel()
@@ -1438,8 +1459,12 @@ class WebcamPreviewWindow(QWidget):
             bgr_frame = self._processed_queue.get_nowait()
         except queue.Empty:
             return
+        display_start = time.perf_counter() if self._prof.enabled else 0.0
         bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
         self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
+        if self._prof.enabled:
+            self._prof.add("display", time.perf_counter() - display_start)
+        self._prof.tick()
 
     def closeEvent(self, event) -> None:
         # __init__ can bail out before these exist (e.g. the camera fails to open),

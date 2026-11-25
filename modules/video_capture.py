@@ -56,6 +56,7 @@ class VideoCapturer:
                     cv2.CAP_PROP_FRAME_WIDTH, width,
                     cv2.CAP_PROP_FRAME_HEIGHT, height,
                     cv2.CAP_PROP_FPS, fps,
+                    cv2.CAP_PROP_BUFFERSIZE, 1,
                 ]
                 capture_methods = [
                     (self.device_index, cv2.CAP_DSHOW),
@@ -78,6 +79,15 @@ class VideoCapturer:
 
             if not self.cap or not self.cap.isOpened():
                 raise RuntimeError("Failed to open camera")
+
+            # Ask the driver to stop queueing frames internally.  DSHOW keeps
+            # 3-5 frames buffered by default, which adds 100-150 ms of latency
+            # before a freshly captured frame reaches the preview.  Backends
+            # that ignore the property just return False, so this is safe.
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
 
             # Belt-and-braces: also set via cap.set() for backends that honor
             # post-open changes (MSMF, V4L2). DSHOW ignores these, but the

@@ -240,11 +240,14 @@ def process_video_map_in_memory(source_path: str, target_path: str, fps: float) 
     length.  Falls back to the disk pipeline in start() on any failure.
     """
     import subprocess
+    import time
     import cv2
     import numpy as np
     from tqdm import tqdm
     from concurrent.futures import ThreadPoolExecutor
-    from modules.utilities import create_temp, get_temp_output_path, resolve_video_encoder
+    from modules.utilities import (
+        create_temp, get_temp_output_path, resolve_video_encoder, StageProfiler,
+    )
     from modules.processors.frame import face_swapper
 
     create_temp(target_path)
@@ -261,6 +264,7 @@ def process_video_map_in_memory(source_path: str, target_path: str, fps: float) 
         return False
 
     num_threads = max(1, int(getattr(modules.globals, 'execution_threads', 1)))
+    prof = StageProfiler('video-map')
     # Bound in-flight frames so a long video never materializes its whole
     # length in memory; 2 frames per worker is enough to keep the GPU fed.
     max_pending = num_threads * 2
@@ -303,6 +307,7 @@ def process_video_map_in_memory(source_path: str, target_path: str, fps: float) 
         return False
 
     def _process_one(frame_index, frame):
+        process_start = time.perf_counter() if prof.enabled else 0.0
         try:
             processed = face_swapper.process_frame_v2(frame, frame_index=frame_index)
         except Exception as e:
@@ -310,6 +315,8 @@ def process_video_map_in_memory(source_path: str, target_path: str, fps: float) 
             processed = frame
         if processed is None:
             processed = frame
+        if prof.enabled:
+            prof.add('process', time.perf_counter() - process_start)
         return processed
 
     written = 0
@@ -319,11 +326,17 @@ def process_video_map_in_memory(source_path: str, target_path: str, fps: float) 
         nonlocal written, broken_pipe
         if processed.shape[0] != height or processed.shape[1] != width:
             processed = cv2.resize(processed, (width, height))
+        write_start = time.perf_counter() if prof.enabled else 0.0
         try:
-            writer.stdin.write(np.ascontiguousarray(processed, dtype=np.uint8).tobytes())
+            # .data hands FFmpeg the frame buffer directly; .tobytes() copied
+            # the whole frame (~6 MB at 1080p) on every write for no reason.
+            buffer = np.ascontiguousarray(processed, dtype=np.uint8)
+            writer.stdin.write(buffer.data)
         except (BrokenPipeError, OSError):
             broken_pipe = True
             return
+        if prof.enabled:
+            prof.add('write_wait', time.perf_counter() - write_start)
         written += 1
 
     try:
@@ -351,12 +364,14 @@ def process_video_map_in_memory(source_path: str, target_path: str, fps: float) 
                     _write_frame(by_index.pop(next_write).result())
                     next_write += 1
                     progress.update(1)
+                    prof.tick()
 
             # Drain the remaining in-flight frames in order.
             while by_index and not broken_pipe:
                 _write_frame(by_index.pop(next_write).result())
                 next_write += 1
                 progress.update(1)
+                prof.tick()
     finally:
         cap.release()
 

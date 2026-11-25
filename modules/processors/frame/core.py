@@ -1,6 +1,9 @@
 import os
+import queue
 import subprocess
 import sys
+import threading
+import time
 import importlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import ModuleType
@@ -327,6 +330,46 @@ def _run_pipe_pipeline(
 
     processed_count = 0
     detect_executor = None
+    write_error: List[str] = []
+
+    # Decouple the blocking FFmpeg stdin write from the GPU pipeline.  Before
+    # this, writer.stdin.write() ran inline: whenever the encoder's pipe was
+    # full it blocked the loop, so the GPU sat idle for the duration of the
+    # write.  A two-deep hand-off queue plus a three-buffer pool lets the
+    # encoder drain in the background while the next frame is processed.
+    # Frames stay zero-copy: a buffer only returns to the pool after FFmpeg
+    # has fully consumed it.
+    write_queue: queue.Queue = queue.Queue(maxsize=2)
+    free_buffers: queue.Queue = queue.Queue()
+    for _ in range(3):
+        free_buffers.put(bytearray(frame_size))
+
+    def _writer_loop() -> None:
+        while True:
+            item = write_queue.get()
+            if item is None:
+                return
+            frame, buf = item
+            try:
+                writer.stdin.write(frame.data)
+            except (BrokenPipeError, OSError) as exc:
+                try:
+                    err = writer.stderr.read().decode(errors='ignore').strip()
+                except Exception:
+                    err = ''
+                write_error.append(f"{exc} {err}".strip())
+                return
+            finally:
+                free_buffers.put(buf)
+
+    from modules.utilities import StageProfiler
+
+    prof = StageProfiler('video')
+    writer_thread = threading.Thread(
+        target=_writer_loop, name='DLC.VIDEO-WRITER', daemon=True
+    )
+    writer_thread.start()
+
     bar_fmt = ('{l_bar}{bar}| {n_fmt}/{total_fmt} '
                '[{elapsed}<{remaining}, {rate_fmt}{postfix}]')
 
@@ -349,15 +392,27 @@ def _run_pipe_pipeline(
             use_pipeline = not modules.globals.many_faces
 
             while True:
-                raw = reader.stdout.read(frame_size)
-                if len(raw) != frame_size:
+                # Read straight into a pooled buffer (no per-frame 6 MB
+                # bytes allocation + copy at 1080p).
+                read_buf = free_buffers.get()
+                read_mv = memoryview(read_buf)
+                total_read = 0
+                while total_read < frame_size:
+                    chunk = reader.stdout.readinto(read_mv[total_read:])
+                    if not chunk:
+                        break
+                    total_read += chunk
+                read_mv.release()
+                if total_read != frame_size:
+                    free_buffers.put(read_buf)
                     break
 
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                frame = np.frombuffer(read_buf, dtype=np.uint8).reshape(
                     (height, width, 3)
-                ).copy()
+                )
 
                 # Get the detection result for THIS frame
+                detect_start = time.perf_counter() if prof.enabled else 0.0
                 if use_pipeline:
                     if pending_detect is not None:
                         target_face = pending_detect.result()
@@ -373,8 +428,11 @@ def _run_pipe_pipeline(
                         _detect_target_face, frame.copy())
                 else:
                     target_face = None
+                if prof.enabled:
+                    prof.add('detect', time.perf_counter() - detect_start)
 
                 # Run frame through every active processor
+                process_start = time.perf_counter() if prof.enabled else 0.0
                 for fp in frame_processors:
                     try:
                         frame = fp.process_frame(source_face, frame, target_face=target_face)
@@ -382,14 +440,41 @@ def _run_pipe_pipeline(
                         if "unexpected keyword argument" not in str(e):
                             raise
                         frame = fp.process_frame(source_face, frame)
+                if prof.enabled:
+                    prof.add('process', time.perf_counter() - process_start)
 
                 if not frame.flags['C_CONTIGUOUS']:
                     frame = np.ascontiguousarray(frame)
-                # Write the buffer directly — tobytes() copied the whole
-                # frame (~6 MB at 1080p) on every frame for no reason.
-                writer.stdin.write(frame.data)
+                # Hand the frame to the writer thread: the encoder pipe never
+                # blocks this loop, and the pooled buffer returns only after
+                # FFmpeg has consumed it.
+                write_start = time.perf_counter() if prof.enabled else 0.0
+                # Blocking hand-off, but never wait forever if the encoder
+                # thread died on a broken pipe — surface the error instead.
+                while True:
+                    try:
+                        write_queue.put((frame, read_buf), timeout=0.5)
+                        break
+                    except queue.Full:
+                        if not writer_thread.is_alive():
+                            free_buffers.put(read_buf)
+                            detail = write_error[0] if write_error else 'encoder thread exited'
+                            raise BrokenPipeError(detail)
+                if prof.enabled:
+                    prof.add('write_wait', time.perf_counter() - write_start)
                 processed_count += 1
                 progress.update(1)
+                prof.tick()
+
+            if writer_thread.is_alive():
+                try:
+                    write_queue.put(None, timeout=5)
+                except queue.Full:
+                    pass
+            writer_thread.join(timeout=10)
+
+        if write_error:
+            raise BrokenPipeError(write_error[0])
 
         # Graceful shutdown
         writer.stdin.close()
@@ -404,13 +489,21 @@ def _run_pipe_pipeline(
 
         return processed_count > 0 and os.path.isfile(temp_output_path)
 
-    except BrokenPipeError:
-        print("[DLC.CORE] FFmpeg pipe broken (encoder may not be available).")
+    except BrokenPipeError as e:
+        print(f"[DLC.CORE] FFmpeg pipe broken (encoder may not be available): {e}")
         return False
     except Exception as e:
         print(f"[DLC.CORE] In-memory processing error: {e}")
         return False
     finally:
+        # If the loop exited abnormally the writer thread is still waiting on
+        # the queue — release it before killing the FFmpeg processes it feeds.
+        if writer_thread is not None and writer_thread.is_alive():
+            try:
+                write_queue.put(None, timeout=1)
+            except Exception:
+                pass
+            writer_thread.join(timeout=5)
         if detect_executor is not None:
             detect_executor.shutdown(wait=True)
         for proc in (reader, writer):
