@@ -147,15 +147,51 @@ def extract_frames(target_path: str) -> bool:
     )
 
 
+_ENCODER_PROBE_CACHE: dict = {}
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    """True when the ffmpeg on PATH was built with ``name``.
+
+    The hardware encoder is picked from the execution provider, but the
+    bundled ffmpeg build may not carry it (plain libx264/libx265 builds are
+    common).  Starting a stream on a missing encoder fails after the first
+    frame, which for the map_faces path means dropping all the way back to
+    PNG extraction.  One ``ffmpeg -encoders`` call per process is cheap.  If
+    the probe itself fails, assume the encoder exists and let the normal
+    runtime fallbacks handle it.
+    """
+    if name not in _ENCODER_PROBE_CACHE:
+        try:
+            listing = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            _ENCODER_PROBE_CACHE[name] = any(
+                len(parts) >= 2 and parts[1] == name
+                for parts in (line.split() for line in listing.splitlines())
+            )
+        except Exception:
+            _ENCODER_PROBE_CACHE[name] = True
+    return _ENCODER_PROBE_CACHE[name]
+
+
 def resolve_video_encoder():
     """Return (encoder, options) for the current hardware and quality settings.
 
     Shared by the PNG-sequence encoder (create_video) and the raw-frame
     streaming encoder (process_video_map_in_memory) so both produce the same
     codec/quality for a given run.
+
+    NVENC uses the same p4 preset as the in-memory pipeline: p7 plus
+    ``-multipass fullres`` roughly halved NVENC throughput for no visible
+    gain at these resolutions, and the map path streams frames live so a slow
+    encoder stalls the whole pass.
     """
     encoder = modules.globals.video_encoder
     encoder_options = []
+    provider_is_gpu = ('CUDAExecutionProvider' in modules.globals.execution_providers
+                       or 'DmlExecutionProvider' in modules.globals.execution_providers)
 
     # GPU-accelerated encoding options
     if 'CUDAExecutionProvider' in modules.globals.execution_providers:
@@ -163,17 +199,16 @@ def resolve_video_encoder():
         if encoder == 'libx264':
             encoder = 'h264_nvenc'
             encoder_options = [
-                "-preset", "p7",  # Highest quality preset for NVENC
+                "-preset", "p4",  # Matches the in-memory pipeline
                 "-tune", "hq",  # High quality tuning
                 "-rc", "vbr",  # Variable bitrate
                 "-cq", str(modules.globals.video_quality),  # Quality level
                 "-b:v", "0",  # Let CQ control bitrate
-                "-multipass", "fullres",  # Two-pass encoding for better quality
             ]
         elif encoder == 'libx265':
             encoder = 'hevc_nvenc'
             encoder_options = [
-                "-preset", "p7",
+                "-preset", "p4",
                 "-tune", "hq",
                 "-rc", "vbr",
                 "-cq", str(modules.globals.video_quality),
@@ -198,7 +233,17 @@ def resolve_video_encoder():
                 "-qp_i", str(modules.globals.video_quality),
                 "-qp_p", str(modules.globals.video_quality),
             ]
-    else:
+
+    # The chosen hardware encoder may be missing from this ffmpeg build; fall
+    # back to software before the stream starts rather than after frame one.
+    if encoder_options and not _ffmpeg_has_encoder(encoder):
+        print(f"[DLC] {encoder} is not available in this ffmpeg build; "
+              f"falling back to {modules.globals.video_encoder}.")
+        encoder = modules.globals.video_encoder
+        encoder_options = []
+        provider_is_gpu = False
+
+    if not provider_is_gpu:
         # CPU encoding with optimized settings
         if encoder == 'libx264':
             encoder_options = [
