@@ -371,7 +371,7 @@ class ROIDetector:
     The full-frame detector letterboxes everything to det_size (640), so its
     inference cost barely changes with input size — cropping alone saves
     almost nothing.  The real win comes from running crop passes on a
-    dedicated small-shape detector (ROI_DET_SIZE=320, see _get_roi_det_model):
+    dedicated small-shape detector (ROI_DET_SIZE=384, see _get_roi_det_model):
     the tracked face fills the crop, so a 4x smaller det grid loses nothing
     in accuracy.  When the tracked face is lost, scores low, or touches the
     crop border (it may have moved out), the detector falls back to one

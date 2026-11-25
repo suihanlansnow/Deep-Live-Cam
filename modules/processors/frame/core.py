@@ -295,6 +295,11 @@ def _run_pipe_pipeline(
     ]
 
     # --- Writer: encode raw BGR24 from stdin ---
+    # When audio is kept, mux the source's audio stream in this same pass (an
+    # optional map, so a source without audio still produces a video-only
+    # file).  The alternative was a second full-file remux pass in
+    # restore_audio() that copied every frame of the completed video again.
+    keep_audio = bool(getattr(modules.globals, 'keep_audio', False))
     writer_cmd = [
         'ffmpeg', '-hide_banner',
         '-f', 'rawvideo',
@@ -302,9 +307,13 @@ def _run_pipe_pipeline(
         '-s', f'{width}x{height}',
         '-r', str(fps),
         '-i', '-',
-        '-c:v', encoder,
     ]
+    if keep_audio:
+        writer_cmd.extend(['-i', target_path])
+    writer_cmd.extend(['-c:v', encoder])
     writer_cmd.extend(encoder_options)
+    if keep_audio:
+        writer_cmd.extend(['-map', '0:v:0', '-map', '1:a:0?', '-c:a', 'copy'])
     writer_cmd.extend([
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',

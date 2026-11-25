@@ -357,8 +357,9 @@ def process_video_map_in_memory(source_path: str, target_path: str, fps: float) 
                 ok, frame = cap.read()
                 if not ok:
                     break
-                # copy so the next cap.read() cannot alias the buffer first
-                by_index[frame_index] = executor.submit(_process_one, frame_index, frame.copy())
+                # No copy: cv2.VideoCapture.read() allocates a fresh buffer on
+                # every call, so the next read cannot alias this frame.
+                by_index[frame_index] = executor.submit(_process_one, frame_index, frame)
                 frame_index += 1
                 # Flush in order once the window is full; waiting on
                 # next_write (not as_completed) keeps output frame order.
@@ -477,6 +478,9 @@ def start() -> None:
         release_resources()
 
         if video_created:
+            # process_video_in_memory muxes the source audio in the same
+            # encode pass, so start() must not run restore_audio() on top.
+            audio_muxed_in_stream = bool(modules.globals.keep_audio)
             update_status(f'In-memory processing + encoding completed in {processing_time:.2f}s')
 
     # --- Disk-based fallback (required for map_faces, or if pipe failed) ---

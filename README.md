@@ -32,6 +32,7 @@
    - `pre_check()` 和 `get_*()` 都用 `ensure_model(..., download=False)` **只查磁盘，绝不联网阻塞**
    - `get_*()` return None 不 raise，`process_frame` 直接返回原帧；一次性日志抑制重复刷屏
 9. **启动后台预热** — `core.run()` 解析完 providers 后，后台线程预构建 swap / 检测 / ROI 三个引擎，首次 Live 不再卡 60 秒。`DLC_NO_WARMUP=1` 可关。
+10. **去整帧拷贝 + 单趟混流** — swap 回粘处的 `astype()` 在 dtype 已是 uint8 时仍整帧复制（1080p 3.8ms/帧），连同 `process_frame(_v2)` 与 map 管线的三处多余拷贝一并移除；非 map 离线管线改为编码同趟混流音频，省掉 `restore_audio()` 的全文件 remux。Live 检测线程改为拷贝投递（避免读到正在原地覆写的帧）并按 30Hz 节流。
 
 ### 回退优先级
 

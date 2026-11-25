@@ -1206,10 +1206,15 @@ class _DetectionWorker(QThread):
     result without ever waiting: detection cost no longer stalls swap frames,
     so the live loop stops seeing the periodic dip every det_interval frames
     (a 60 fps camera budget of 16.7 ms cannot fit detection + swap inline).
-    Detection rate self-throttles to however fast the detector runs — it
-    always works on the newest frame and results older than that are simply
-    overwritten, matching the drop-stale queue policy.
+    Detection runs on its own cadence (MIN_INTERVAL_S): it always works on
+    the newest frame and results older than that are simply overwritten,
+    matching the drop-stale queue policy.
     """
+
+    # The preview cannot show more than this anyway; detecting faster only
+    # competes with the swap for the GPU and adds thermal load.  A detection
+    # result is reused until replaced, so this is a cadence cap, not a skip.
+    MIN_INTERVAL_S = 1.0 / 30.0
 
     def __init__(self, stop_event: threading.Event):
         super().__init__()
@@ -1220,10 +1225,15 @@ class _DetectionWorker(QThread):
         self._result = None  # latest (target_face, many_faces) pair
         self._roi = ROIDetector()
         self._prof = StageProfiler("live-det")
+        self._last_detect = 0.0
 
     def submit(self, frame) -> None:
         with self._lock:
-            self._frame = frame
+            # Detach from the processing thread's buffer: swap_face pastes
+            # back in place on that same array, so a shared reference would
+            # let the detector read a half-swapped face and jitter the
+            # keypoints.  A 640x480 copy costs ~0.08 ms.
+            self._frame = frame.copy()
         self._has_frame.set()
 
     def latest(self):
@@ -1234,12 +1244,19 @@ class _DetectionWorker(QThread):
         while not self._stop.is_set():
             if not self._has_frame.wait(timeout=0.1):
                 continue
+            # Cadence cap: sleeping on the stop event keeps shutdown prompt.
+            # Because submit() always overwrites _frame, whatever is newest at
+            # wake-up is what gets detected — the wait coalesces by itself.
+            remaining = self.MIN_INTERVAL_S - (time.perf_counter() - self._last_detect)
+            if remaining > 0:
+                self._stop.wait(timeout=remaining)
             self._has_frame.clear()
             with self._lock:
                 frame = self._frame
                 self._frame = None
             if frame is None:
                 continue
+            self._last_detect = time.perf_counter()
             detect_start = time.perf_counter() if self._prof.enabled else 0.0
             if modules.globals.many_faces:
                 target_face, many_faces = None, detect_many_faces_fast(frame)
@@ -1508,9 +1525,15 @@ class WebcamPreviewWindow(QWidget):
         if self._stop_event.is_set():
             self.close()
             return
+        # Drain to the newest frame.  The queue holds at most two, and showing
+        # the older one would add a frame of latency for no visual gain.
+        bgr_frame = None
         try:
-            bgr_frame = self._processed_queue.get_nowait()
+            while True:
+                bgr_frame = self._processed_queue.get_nowait()
         except queue.Empty:
+            pass
+        if bgr_frame is None:
             return
         display_start = time.perf_counter() if self._prof.enabled else 0.0
         bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
