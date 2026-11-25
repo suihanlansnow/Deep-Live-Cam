@@ -25,10 +25,13 @@
 2. **TensorRT FP32 EP** — `face_swapper.py` 的 `_tensorrt_providers()` 探测 DLL、校验 `ort.get_available_providers()`、缓存 engine 到 `models/trt_cache/`。**FP32 而非 FP16**（inswapper FP16 会出红斑伪影），与 CUDA 输出 ≤2/255。`DLC_DISABLE_TENSORRT=1` 强制关闭。
 3. **CUDA graph replay** — TRT 不可用时，ORT session 开 `enable_cuda_graph`，每帧推理退化为 `update_inplace + run_with_iobinding`。与 TRT **互斥**。
 4. **map_faces 流式编码** — 预处理直接 `cv2.imencode` → ffmpeg stdin，零磁盘往返；编码同趟混音。
-5. **Live 检测频率** — `det_interval = max(1, round(fps * 0.08))`，30 fps 摄像头每 2 帧检测一次。
-6. **Live 卡死修复** — 三个 enhancer（GFPGAN / GPEN-BFR-256 / 512）模型缺失时：
+5. **检测 ROI 追踪** — `ROIDetector` 用上一帧 bbox 外扩 1.6× 裁剪送检，在专用 384 会话上跑（时序抖动 rms 0.56px，比全帧 640 的 1.98px 更稳），CPU 上检测 113ms → 49ms；丢失/贴边自动回落全帧重锁。离线管线的检测线程同样受益。
+6. **检测模型 TensorRT 化** — det 输入固定 letterbox 到 det_size，按 `1x3x640x640` 静态 profile 构建 TRT engine，推理约减半；ROI 会话按 `384` 静态 profile 独立构建。
+7. **Live 检测线程分离** — 检测挪到独立 `QThread`：处理线程投递最新帧并直接取结果，永不等待。60fps 摄像头 16.7ms 帧预算不再被内联检测挤爆，消除周期性顿挫。
+8. **Live 卡死修复** — 三个 enhancer（GFPGAN / GPEN-BFR-256 / 512）模型缺失时：
    - `pre_check()` 和 `get_*()` 都用 `ensure_model(..., download=False)` **只查磁盘，绝不联网阻塞**
    - `get_*()` return None 不 raise，`process_frame` 直接返回原帧；一次性日志抑制重复刷屏
+9. **启动后台预热** — `core.run()` 解析完 providers 后，后台线程预构建 swap / 检测 / ROI 三个引擎，首次 Live 不再卡 60 秒。`DLC_NO_WARMUP=1` 可关。
 
 ### 回退优先级
 

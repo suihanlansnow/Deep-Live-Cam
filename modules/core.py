@@ -1,5 +1,7 @@
 import os
 import sys
+import threading
+import time
 # single thread doubles cuda performance - needs to be set before torch import
 if any(arg.startswith('--execution-provider') for arg in sys.argv):
     os.environ['OMP_NUM_THREADS'] = '6'
@@ -554,10 +556,26 @@ def run() -> None:
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_check():
             return
-    # Pre-load face analyser in main thread before GUI starts
-    #from modules.face_analyser import get_face_analyser
-    #get_face_analyser()
     limit_resources()
+    if not modules.globals.headless and os.environ.get("DLC_NO_WARMUP") != "1":
+        # Warm the GPU engines in the background now that the execution
+        # providers are resolved: first Live otherwise stalls on TensorRT
+        # engine construction (~60 s cold cache) while the UI is already up.
+        def _warm_up() -> None:
+            time.sleep(2.0)  # let the UI paint first; warm-up competes for CPU/GPU
+            try:
+                from modules.face_analyser import get_face_analyser, _get_roi_det_model
+                from modules.processors.frame.face_swapper import get_face_swapper
+
+                print("[startup] Warming up models in background...", flush=True)
+                get_face_analyser()      # buffalo_l incl. TRT detection engine
+                _get_roi_det_model()     # small-shape ROI detector
+                get_face_swapper()       # inswapper incl. TRT engine
+                print("[startup] Model warm-up complete.", flush=True)
+            except Exception as e:
+                print(f"[startup] Model warm-up skipped: {e}", flush=True)
+
+        threading.Thread(target=_warm_up, name="DLC.WARMUP", daemon=True).start()
     if modules.globals.headless:
         start()
     else:

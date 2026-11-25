@@ -57,13 +57,13 @@ from modules.capturer import get_video_frame, get_video_frame_total
 from modules.face_analyser import (
     add_blank_map,
     detect_many_faces_fast,
-    detect_one_face_fast,
     ensure_landmarks,
     get_one_face,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
     has_valid_map,
     reset_face_analyser,
+    ROIDetector,
     simplify_maps,
 )
 from modules.gettext import LanguageManager
@@ -271,6 +271,8 @@ def fit_image_to_size(image, width: int, height: int):
     ratio_h = height / h
     ratio = min(ratio_w, ratio_h)
     new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
+    if new_size == (w, h):
+        return image
     return gpu_resize(image, dsize=new_size)
 
 
@@ -1197,6 +1199,59 @@ class _CaptureWorker(QThread):
                     pass
 
 
+class _DetectionWorker(QThread):
+    """Runs face detection off the processing thread.
+
+    The processing thread hands over the newest frame and reads the freshest
+    result without ever waiting: detection cost no longer stalls swap frames,
+    so the live loop stops seeing the periodic dip every det_interval frames
+    (a 60 fps camera budget of 16.7 ms cannot fit detection + swap inline).
+    Detection rate self-throttles to however fast the detector runs — it
+    always works on the newest frame and results older than that are simply
+    overwritten, matching the drop-stale queue policy.
+    """
+
+    def __init__(self, stop_event: threading.Event):
+        super().__init__()
+        self._stop = stop_event
+        self._lock = threading.Lock()
+        self._frame = None  # newest submitted frame
+        self._has_frame = threading.Event()
+        self._result = None  # latest (target_face, many_faces) pair
+        self._roi = ROIDetector()
+        self._prof = StageProfiler("live-det")
+
+    def submit(self, frame) -> None:
+        with self._lock:
+            self._frame = frame
+        self._has_frame.set()
+
+    def latest(self):
+        with self._lock:
+            return self._result
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            if not self._has_frame.wait(timeout=0.1):
+                continue
+            self._has_frame.clear()
+            with self._lock:
+                frame = self._frame
+                self._frame = None
+            if frame is None:
+                continue
+            detect_start = time.perf_counter() if self._prof.enabled else 0.0
+            if modules.globals.many_faces:
+                target_face, many_faces = None, detect_many_faces_fast(frame)
+            else:
+                target_face, many_faces = self._roi.detect(frame), None
+            if self._prof.enabled:
+                self._prof.add("detect", time.perf_counter() - detect_start)
+            with self._lock:
+                self._result = (target_face, many_faces)
+            self._prof.tick()
+
+
 class _ProcessingWorker(QThread):
     """Pulls raw frames, runs detect/swap/enhance, pushes processed frames."""
 
@@ -1218,10 +1273,10 @@ class _ProcessingWorker(QThread):
         fps_update_interval = 0.5
         frame_count = 0
         fps = 0.0
-        det_count = 0
+        det_worker = _DetectionWorker(self._stop)
+        det_worker.start()
         cached_target_face = None
         cached_many_faces = None
-        det_interval = max(1, round(self._fps * 0.08))
         prof = StageProfiler("live")
 
         while not self._stop.is_set():
@@ -1270,17 +1325,13 @@ class _ProcessingWorker(QThread):
                         reported_source_error = None
                         source_image = get_one_face(source_frame)
 
-                det_count += 1
-                if det_count % det_interval == 0:
-                    detect_start = time.perf_counter() if prof.enabled else 0.0
-                    if modules.globals.many_faces:
-                        cached_target_face = None
-                        cached_many_faces = detect_many_faces_fast(temp_frame)
-                    else:
-                        cached_target_face = detect_one_face_fast(temp_frame)
-                        cached_many_faces = None
-                    if prof.enabled:
-                        prof.add("detect", time.perf_counter() - detect_start)
+                # Off-thread detection: hand the freshest frame over and pick
+                # up whatever the detection worker has finished.  Results
+                # persist across frames until the worker replaces them, so
+                # between detections the last face is reused — same caching
+                # semantics as the old inline det_interval loop.
+                det_worker.submit(temp_frame)
+                cached_target_face, cached_many_faces = det_worker.latest()
 
                 cached_faces = None
                 if cached_many_faces:
@@ -1314,12 +1365,13 @@ class _ProcessingWorker(QThread):
                         swap_start = time.perf_counter() if prof.enabled else 0.0
                         swapped_bboxes = []
                         if modules.globals.many_faces and cached_many_faces:
-                            result = temp_frame.copy()
+                            # swap_face pastes back in place and returns the
+                            # same buffer, so iterating on temp_frame itself
+                            # avoids a full-frame copy per frame.
                             for t_face in cached_many_faces:
-                                result = fp.swap_face(source_image, t_face, result)
+                                temp_frame = fp.swap_face(source_image, t_face, temp_frame)
                                 if hasattr(t_face, "bbox") and t_face.bbox is not None:
                                     swapped_bboxes.append(t_face.bbox.astype(int))
-                            temp_frame = result
                         elif cached_target_face is not None:
                             if modules.globals.live_async_swap:
                                 if async_swapper is None:
@@ -1404,6 +1456,7 @@ class _ProcessingWorker(QThread):
 
         if async_swapper is not None:
             async_swapper.close()
+        det_worker.wait()
 
 
 class WebcamPreviewWindow(QWidget):

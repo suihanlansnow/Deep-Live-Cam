@@ -108,17 +108,21 @@ def process_video(source_path: str, frame_paths: list[str], process_frames: Call
         multi_process_frame(source_path, frame_paths, process_frames, progress)
 
 
-def _detect_target_face(frame: np.ndarray) -> Any:
+def _detect_target_face(frame: np.ndarray, detector: Any = None) -> Any:
     """Detection-only target lookup for the pipelined in-memory video path.
 
     The swap model needs only a bbox and 5 keypoints from the target face, so
     running the full analysis (recognition + 2d106 landmarks) on every frame
     was pure overhead.  Recognition only matters for map_faces embedding
     matching, and landmarks are still computed when mouth masking needs them.
+
+    ``detector`` optionally carries per-pipeline ROI tracking state; the
+    single-threaded detect executor owns it, so the tracker sees frames in
+    order across the pipeline.
     """
     from modules.face_analyser import detect_one_face_fast, ensure_landmarks
 
-    face = detect_one_face_fast(frame)
+    face = detector.detect(frame) if detector is not None else detect_one_face_fast(frame)
     if face is not None and getattr(modules.globals, 'mouth_mask', False):
         ensure_landmarks(frame, face)
     return face
@@ -390,6 +394,12 @@ def _run_pipe_pipeline(
             detect_executor = ThreadPoolExecutor(max_workers=1)
             pending_detect = None
             use_pipeline = not modules.globals.many_faces
+            # Per-pipeline ROI tracker: the detect executor is single-threaded
+            # and receives frames in order, so the tracker is safe here.
+            roi_detector = None
+            if use_pipeline:
+                from modules.face_analyser import ROIDetector
+                roi_detector = ROIDetector()
 
             while True:
                 # Read straight into a pooled buffer (no per-frame 6 MB
@@ -417,7 +427,7 @@ def _run_pipe_pipeline(
                     if pending_detect is not None:
                         target_face = pending_detect.result()
                     else:
-                        target_face = _detect_target_face(frame)
+                        target_face = _detect_target_face(frame, roi_detector)
                     # Start detecting on THIS frame eagerly — the result
                     # will be used for the next iteration.  At video
                     # frame rates the face barely moves between frames.
@@ -425,7 +435,7 @@ def _run_pipe_pipeline(
                     # below mutate `frame` in place (paste-back), which
                     # would otherwise race with detection.
                     pending_detect = detect_executor.submit(
-                        _detect_target_face, frame.copy())
+                        _detect_target_face, frame.copy(), roi_detector)
                 else:
                     target_face = None
                 if prof.enabled:
