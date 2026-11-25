@@ -29,3 +29,9 @@ switch_states.json
 install.bat
 /.claude
 *.bat
+
+third_party/TensorRT/
+models/trt_cache/
+.trae-html-share-packages/
+map-faces-streaming-report/
+run_map_faces_baseline.py

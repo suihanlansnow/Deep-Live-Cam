@@ -24,12 +24,32 @@ if sys.platform == "win32":
                 _bin_dir = os.path.join(_nvidia_dir, _pkg, "bin")
                 if os.path.isdir(_bin_dir):
                     _candidate_dirs.append(_bin_dir)
+        # CUDA Toolkit install (if present) supplies cudart64_12.dll /
+        # cublas64_12.dll as a fallback when the pip nvidia-* wheels are absent.
+        _cuda_path = os.environ.get("CUDA_PATH")
+        if _cuda_path:
+            _cuda_bin = os.path.join(_cuda_path, "bin")
+            if os.path.isdir(_cuda_bin):
+                _candidate_dirs.append(_cuda_bin)
         for _d in _candidate_dirs:
             os.environ["PATH"] = _d + os.pathsep + os.environ["PATH"]
             try:
                 os.add_dll_directory(_d)
             except (OSError, AttributeError):
                 pass
+
+    # Optional TensorRT runtime (nvinfer_10.dll etc.).  When present it is
+    # registered before onnxruntime loads its TensorRT provider; the face
+    # swapper then prefers the TensorRT EP and falls back to CUDA on failure.
+    _trt_bin = os.environ.get("TENSORRT_PATH") or os.path.join(
+        project_root, "third_party", "TensorRT", "bin"
+    )
+    if os.path.isdir(_trt_bin):
+        os.environ["PATH"] = _trt_bin + os.pathsep + os.environ["PATH"]
+        try:
+            os.add_dll_directory(_trt_bin)
+        except (OSError, AttributeError):
+            pass
 
     # On Windows, register OpenVINO DLL directories so onnxruntime's
     # OpenVINOExecutionProvider can find openvino.dll.  This must happen

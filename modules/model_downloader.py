@@ -65,7 +65,18 @@ def expected_size(name: str) -> Optional[int]:
 
 def is_present(name: str, dest_dir: Optional[str] = None) -> bool:
     path = local_path(name, dest_dir)
-    return os.path.isfile(path) and os.path.getsize(path) > 0
+    if not os.path.isfile(path):
+        return False
+    actual = os.path.getsize(path)
+    if actual <= 0:
+        return False
+    # Reject truncated/partial files: a non-.part file whose size differs
+    # from the expected size would otherwise be treated as valid and only
+    # fail later inside the ONNX runtime, which is hard to diagnose.
+    expected = expected_size(name)
+    if expected is not None and actual != expected:
+        return False
+    return True
 
 
 def _download(name: str, url: str, target: str, size: Optional[int]) -> bool:

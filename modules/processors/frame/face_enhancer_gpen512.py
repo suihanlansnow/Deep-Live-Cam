@@ -1,5 +1,7 @@
 """GPEN-BFR-512 face enhancer — ONNX-based face restoration at 512x512."""
 
+from __future__ import annotations
+
 from typing import Any, List
 import os
 import threading
@@ -100,10 +102,11 @@ def enhance_face(temp_frame: Frame, face: Face) -> Frame:
         return temp_frame
 
 
-def process_frame(source_face: Face | None, temp_frame: Frame, detected_faces=None) -> Frame:
+def process_frame(source_face: Face | None, temp_frame: Frame, detected_faces=None,
+                  target_face: Face | None = None) -> Frame:
     if detected_faces:
         target_face = detected_faces[0]
-    else:
+    elif target_face is None:
         target_face = get_one_face(temp_frame)
     if target_face is None:
         return temp_frame

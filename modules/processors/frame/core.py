@@ -2,7 +2,7 @@ import os
 import subprocess
 import sys
 import importlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import ModuleType
 from typing import Any, List, Callable
 
@@ -82,29 +82,19 @@ def set_frame_processors_modules_from_ui(frame_processors: List[str]) -> None:
                  print(f"Warning: Error removing frame processor {frame_processor}: {e}")
 
 def multi_process_frame(source_path: str, temp_frame_paths: List[str], process_frames: Callable[[str, List[str], Any], None], progress: Any = None) -> None:
-    """Process frames in parallel with optimized batching and memory management."""
+    """Process frames in parallel without batch barriers."""
     max_workers = modules.globals.execution_threads
-    
-    # Determine optimal batch size based on available memory and thread count
-    # Process frames in batches to avoid memory overflow
-    batch_size = max(1, min(32, len(temp_frame_paths) // max(1, max_workers)))
-    
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Process in batches to manage memory better
-        for i in range(0, len(temp_frame_paths), batch_size):
-            batch = temp_frame_paths[i:i + batch_size]
-            futures = []
-            
-            for path in batch:
-                future = executor.submit(process_frames, source_path, [path], progress)
-                futures.append(future)
-            
-            # Wait for batch to complete before starting next batch
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Error processing frame: {e}")
+        futures = [
+            executor.submit(process_frames, source_path, [path], progress)
+            for path in temp_frame_paths
+        ]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Error processing frame: {e}")
 
 
 def process_video(source_path: str, frame_paths: list[str], process_frames: Callable[[str, List[str], Any], None]) -> None:
@@ -113,6 +103,22 @@ def process_video(source_path: str, frame_paths: list[str], process_frames: Call
     with tqdm(total=total, desc='Processing', unit='frame', dynamic_ncols=True, bar_format=progress_bar_format) as progress:
         progress.set_postfix({'execution_providers': modules.globals.execution_providers, 'execution_threads': modules.globals.execution_threads, 'max_memory': modules.globals.max_memory})
         multi_process_frame(source_path, frame_paths, process_frames, progress)
+
+
+def _detect_target_face(frame: np.ndarray) -> Any:
+    """Detection-only target lookup for the pipelined in-memory video path.
+
+    The swap model needs only a bbox and 5 keypoints from the target face, so
+    running the full analysis (recognition + 2d106 landmarks) on every frame
+    was pure overhead.  Recognition only matters for map_faces embedding
+    matching, and landmarks are still computed when mouth masking needs them.
+    """
+    from modules.face_analyser import detect_one_face_fast, ensure_landmarks
+
+    face = detect_one_face_fast(frame)
+    if face is not None and getattr(modules.globals, 'mouth_mask', False):
+        ensure_landmarks(frame, face)
+    return face
 
 
 def process_video_in_memory(source_path: str, target_path: str, fps: float) -> bool:
@@ -320,11 +326,13 @@ def _run_pipe_pipeline(
         return False
 
     processed_count = 0
+    detect_executor = None
     bar_fmt = ('{l_bar}{bar}| {n_fmt}/{total_fmt} '
                '[{elapsed}<{remaining}, {rate_fmt}{postfix}]')
 
     try:
-        with tqdm(total=total_frames, desc='Processing', unit='frame',
+        with tqdm(total=total_frames if total_frames > 0 else None,
+                  desc='Processing', unit='frame',
                   dynamic_ncols=True, bar_format=bar_fmt) as progress:
             progress.set_postfix({
                 'execution_providers': modules.globals.execution_providers,
@@ -354,7 +362,7 @@ def _run_pipe_pipeline(
                     if pending_detect is not None:
                         target_face = pending_detect.result()
                     else:
-                        target_face = get_one_face(frame)
+                        target_face = _detect_target_face(frame)
                     # Start detecting on THIS frame eagerly — the result
                     # will be used for the next iteration.  At video
                     # frame rates the face barely moves between frames.
@@ -362,7 +370,7 @@ def _run_pipe_pipeline(
                     # below mutate `frame` in place (paste-back), which
                     # would otherwise race with detection.
                     pending_detect = detect_executor.submit(
-                        get_one_face, frame.copy())
+                        _detect_target_face, frame.copy())
                 else:
                     target_face = None
 
@@ -370,14 +378,18 @@ def _run_pipe_pipeline(
                 for fp in frame_processors:
                     try:
                         frame = fp.process_frame(source_face, frame, target_face=target_face)
-                    except TypeError:
+                    except TypeError as e:
+                        if "unexpected keyword argument" not in str(e):
+                            raise
                         frame = fp.process_frame(source_face, frame)
 
-                writer.stdin.write(frame.tobytes())
+                if not frame.flags['C_CONTIGUOUS']:
+                    frame = np.ascontiguousarray(frame)
+                # Write the buffer directly — tobytes() copied the whole
+                # frame (~6 MB at 1080p) on every frame for no reason.
+                writer.stdin.write(frame.data)
                 processed_count += 1
                 progress.update(1)
-
-            detect_executor.shutdown(wait=True)
 
         # Graceful shutdown
         writer.stdin.close()
@@ -399,9 +411,19 @@ def _run_pipe_pipeline(
         print(f"[DLC.CORE] In-memory processing error: {e}")
         return False
     finally:
+        if detect_executor is not None:
+            detect_executor.shutdown(wait=True)
         for proc in (reader, writer):
-            if proc:
+            if proc is not None and proc.poll() is None:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+        for proc in (reader, writer):
+            if proc is not None:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass

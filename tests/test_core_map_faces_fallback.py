@@ -31,6 +31,11 @@ def _patched_core_import_stubs(calls, pipe_result=False):
                 True,
                 types.SimpleNamespace(tofile=lambda *_a, **_k: None),
             ),
+            # In-memory map pipeline must bail out so the disk fallback runs.
+            VideoCapture=lambda _path: types.SimpleNamespace(
+                isOpened=lambda: False,
+                release=lambda: None,
+            ),
         ),
         "numpy": types.SimpleNamespace(uint8=object, fromfile=lambda *_args, **_kwargs: b""),
         "torch": types.SimpleNamespace(
@@ -51,6 +56,10 @@ def _patched_core_import_stubs(calls, pipe_result=False):
             process_video_in_memory=lambda *_args, **_kwargs: calls.append(("pipe",))
             or pipe_result,
         ),
+        "modules.processors.frame.face_swapper": types.SimpleNamespace(
+            NAME="face_swapper_stub",
+            process_frame_v2=lambda frame, **_kwargs: frame,
+        ),
         "modules.utilities": types.SimpleNamespace(
             has_image_extension=lambda _path: False,
             is_image=lambda _path: False,
@@ -62,8 +71,12 @@ def _patched_core_import_stubs(calls, pipe_result=False):
             or True,
             extract_frames=lambda target_path: calls.append(
                 ("extract_frames", target_path)
-            ),
+            )
+            or True,
             get_temp_frame_paths=lambda target_path: [f"{target_path}/0001.png"],
+            get_temp_output_path=lambda target_path: f"{target_path}/temp.mp4",
+            get_temp_directory_path=lambda target_path: f"{target_path}/temp",
+            resolve_video_encoder=lambda: ("libx264", []),
             restore_audio=lambda *_args, **_kwargs: calls.append(("restore_audio",)),
             create_temp=lambda target_path: calls.append(("create_temp", target_path)),
             move_temp=lambda target_path, output_path: calls.append(

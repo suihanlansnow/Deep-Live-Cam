@@ -11,11 +11,7 @@ import platform
 import signal
 import shutil
 import argparse
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+import importlib.util
 import onnxruntime
 try:
     import tensorflow
@@ -23,14 +19,16 @@ try:
 except ImportError:
     HAS_TENSORFLOW = False
 
+try:
+    HAS_TORCH = importlib.util.find_spec("torch") is not None
+except (ImportError, ValueError):
+    HAS_TORCH = False
+
 import modules.globals
 import modules.metadata
 import modules.ui as ui
 from modules.processors.frame.core import get_frame_processors_modules, process_video_in_memory
 from modules.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
-
-if HAS_TORCH and 'ROCMExecutionProvider' in modules.globals.execution_providers:
-    del torch
 
 warnings.filterwarnings('ignore', category=FutureWarning, module='insightface')
 if HAS_TORCH:
@@ -188,7 +186,14 @@ def limit_resources() -> None:
         if platform.system().lower() == 'windows':
             import ctypes
             kernel32 = ctypes.windll.kernel32
-            kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
+            # The working-set minimum is what Windows tries to keep resident.
+            # Setting it to the limit itself asked the OS to pin max_memory
+            # gigabytes — the opposite of limiting.  Only the maximum acts as
+            # a cap; keep the minimum small so idle pages can still be trimmed.
+            min_memory = min(memory, 512 * 1024 ** 2)
+            kernel32.SetProcessWorkingSetSize(
+                -1, ctypes.c_size_t(min_memory), ctypes.c_size_t(memory),
+            )
         else:
             import resource
             resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
@@ -196,7 +201,9 @@ def limit_resources() -> None:
 
 def release_resources() -> None:
     if 'CUDAExecutionProvider' in modules.globals.execution_providers and HAS_TORCH:
-        torch.cuda.empty_cache()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def pre_check() -> bool:
@@ -213,6 +220,165 @@ def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     print(f'[{scope}] {message}')
     if not modules.globals.headless:
         ui.update_status(message)
+
+def process_video_map_in_memory(source_path: str, target_path: str, fps: float) -> bool:
+    """map_faces video pipeline: decode -> swap -> stream straight to FFmpeg.
+
+    Decodes input frames directly with cv2 (pixel-identical to the legacy
+    PNG round-trip) and swaps each frame via face_swapper.process_frame_v2
+    keyed by frame index.  Processed frames are written to the FFmpeg encoder's
+    stdin in strict frame order, so the whole run touches zero PNGs (the old
+    path wrote one PNG per output frame and read them all back to encode).
+
+    The encoder also muxes the source audio in the same pass with an optional
+    stream map (`-map 1:a:0?`), so a source without audio no longer errors and
+    the separate restore_audio copy is skipped.
+
+    A worker pool overlaps the swap/GPU work with the blocking stdin writes,
+    and ordered flushing keeps frame order.  A sliding window bounds how many
+    decoded frames are held pending, so memory stays flat regardless of video
+    length.  Falls back to the disk pipeline in start() on any failure.
+    """
+    import subprocess
+    import cv2
+    import numpy as np
+    from tqdm import tqdm
+    from concurrent.futures import ThreadPoolExecutor
+    from modules.utilities import create_temp, get_temp_output_path, resolve_video_encoder
+    from modules.processors.frame import face_swapper
+
+    create_temp(target_path)
+    temp_output_path = get_temp_output_path(target_path)
+
+    cap = cv2.VideoCapture(target_path)
+    if not cap.isOpened():
+        return False
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if width <= 0 or height <= 0:
+        cap.release()
+        return False
+
+    num_threads = max(1, int(getattr(modules.globals, 'execution_threads', 1)))
+    # Bound in-flight frames so a long video never materializes its whole
+    # length in memory; 2 frames per worker is enough to keep the GPU fed.
+    max_pending = num_threads * 2
+    encoder, encoder_options = resolve_video_encoder()
+    keep_audio = bool(getattr(modules.globals, 'keep_audio', False))
+
+    # --- Writer: encode raw BGR24 from stdin (and mux source audio in-pass) ---
+    writer_cmd = [
+        'ffmpeg', '-hide_banner',
+        '-f', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f'{width}x{height}',
+        '-r', str(fps),
+        '-i', '-',
+    ]
+    if keep_audio:
+        writer_cmd.extend(['-i', target_path])
+    writer_cmd.extend(['-c:v', encoder])
+    writer_cmd.extend(encoder_options)
+    if keep_audio:
+        # Optional map: silently produces a video-only file when the source
+        # has no audio stream instead of failing the whole run.
+        writer_cmd.extend(['-map', '0:v:0', '-map', '1:a:0?', '-c:a', 'copy'])
+    writer_cmd.extend([
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        '-vf', 'colorspace=bt709:iall=bt601-6-625:fast=1',
+        '-v', 'error',
+        '-y', temp_output_path,
+    ])
+
+    writer = None
+    try:
+        writer = subprocess.Popen(
+            writer_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        print(f"[DLC.CORE] Failed to start FFmpeg encoder: {e}")
+        cap.release()
+        return False
+
+    def _process_one(frame_index, frame):
+        try:
+            processed = face_swapper.process_frame_v2(frame, frame_index=frame_index)
+        except Exception as e:
+            print(f"{face_swapper.NAME}: Error processing frame {frame_index}: {e}")
+            processed = frame
+        if processed is None:
+            processed = frame
+        return processed
+
+    written = 0
+    broken_pipe = False
+
+    def _write_frame(processed):
+        nonlocal written, broken_pipe
+        if processed.shape[0] != height or processed.shape[1] != width:
+            processed = cv2.resize(processed, (width, height))
+        try:
+            writer.stdin.write(np.ascontiguousarray(processed, dtype=np.uint8).tobytes())
+        except (BrokenPipeError, OSError):
+            broken_pipe = True
+            return
+        written += 1
+
+    try:
+        with ThreadPoolExecutor(max_workers=num_threads) as executor, \
+             tqdm(total=total if total > 0 else None, desc='Processing', unit='frame',
+                  dynamic_ncols=True) as progress:
+            progress.set_postfix({
+                'mode': 'in-memory(map,stream)',
+                'threads': num_threads,
+                'execution_providers': modules.globals.execution_providers,
+            })
+            by_index = {}
+            next_write = 0
+            frame_index = 0
+            while not broken_pipe:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                # copy so the next cap.read() cannot alias the buffer first
+                by_index[frame_index] = executor.submit(_process_one, frame_index, frame.copy())
+                frame_index += 1
+                # Flush in order once the window is full; waiting on
+                # next_write (not as_completed) keeps output frame order.
+                while len(by_index) > max_pending and not broken_pipe:
+                    _write_frame(by_index.pop(next_write).result())
+                    next_write += 1
+                    progress.update(1)
+
+            # Drain the remaining in-flight frames in order.
+            while by_index and not broken_pipe:
+                _write_frame(by_index.pop(next_write).result())
+                next_write += 1
+                progress.update(1)
+    finally:
+        cap.release()
+
+    try:
+        writer.stdin.close()
+        stderr_output = writer.stderr.read()
+        returncode = writer.wait()
+    except Exception as e:
+        print(f"[DLC.CORE] Failed to finalize encoder: {e}")
+        try:
+            writer.kill()
+        except Exception:
+            pass
+        return False
+
+    if broken_pipe or returncode != 0 or written == 0:
+        message = stderr_output.decode(errors='ignore').strip()
+        print(f"[DLC.CORE] Streaming encode failed (rc={returncode}, frames={written})"
+              + (f": {message}" if message else ''))
+        return False
+    return os.path.isfile(temp_output_path)
+
 
 def start() -> None:
     """Start processing with performance monitoring."""
@@ -256,11 +422,31 @@ def start() -> None:
         fps = 30.0
 
     video_created = False
+    # The streaming map pipeline muxes the source audio in the same encode
+    # pass, so start() must not run a second full-file copy for it.
+    audio_muxed_in_stream = False
 
-    # --- In-memory pipeline (non-map_faces only) ---
-    # Reads frames from FFmpeg pipe, processes in memory, encodes directly.
-    # Eliminates all per-frame PNG disk I/O for a major speed-up.
-    if not modules.globals.map_faces:
+    # --- In-memory pipeline ---
+    # map_faces: decode input frames directly (no PNG extraction), swap keyed
+    # by frame index, write processed PNGs, encode via create_video (same
+    # encode as the disk path => bit-comparable output).
+    # non-map: reads frames from FFmpeg pipe, processes in memory, encodes
+    # directly (eliminates all per-frame PNG disk I/O).
+    if modules.globals.map_faces:
+        update_status(f'Processing video in-memory (map_faces) at {fps} fps...')
+        processing_start = time.time()
+        video_created = process_video_map_in_memory(
+            modules.globals.source_path,
+            modules.globals.target_path,
+            fps,
+        )
+        processing_time = time.time() - processing_start
+        release_resources()
+
+        if video_created:
+            audio_muxed_in_stream = bool(modules.globals.keep_audio)
+            update_status(f'In-memory map processing + encoding completed in {processing_time:.2f}s')
+    else:
         update_status(f'Processing video in-memory at {fps} fps...')
         create_temp(modules.globals.target_path)
 
@@ -284,7 +470,10 @@ def start() -> None:
         extraction_start = time.time()
         create_temp(modules.globals.target_path)
         update_status('Extracting frames...')
-        extract_frames(modules.globals.target_path)
+        if not extract_frames(modules.globals.target_path):
+            update_status('Extracting frames failed!')
+            clean_temp(modules.globals.target_path)
+            return
         extraction_time = time.time() - extraction_start
 
         temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
@@ -314,11 +503,15 @@ def start() -> None:
     
     # handle audio
     if modules.globals.keep_audio:
-        if modules.globals.keep_fps:
+        if audio_muxed_in_stream:
+            update_status('Audio already muxed during encoding.')
+            move_temp(modules.globals.target_path, modules.globals.output_path)
+        elif modules.globals.keep_fps:
             update_status('Restoring audio...')
+            restore_audio(modules.globals.target_path, modules.globals.output_path)
         else:
             update_status('Restoring audio might cause issues as fps are not kept...')
-        restore_audio(modules.globals.target_path, modules.globals.output_path)
+            restore_audio(modules.globals.target_path, modules.globals.output_path)
     else:
         move_temp(modules.globals.target_path, modules.globals.output_path)
     

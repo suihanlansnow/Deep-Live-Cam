@@ -66,13 +66,13 @@ def detect_fps(target_path: str) -> float:
     return 30.0
 
 
-def extract_frames(target_path: str) -> None:
+def extract_frames(target_path: str) -> bool:
     """Extract frames with hardware acceleration and optimized settings."""
     temp_directory_path = get_temp_directory_path(target_path)
-    
+
     # Write a contiguous image sequence so the later "%04d.png" input pattern
     # used during encoding can consume every frame reliably.
-    run_ffmpeg(
+    return run_ffmpeg(
         [
             "-i", target_path,
             "-vf", "format=rgb24",  # Use video filter for format conversion (faster)
@@ -82,15 +82,16 @@ def extract_frames(target_path: str) -> None:
     )
 
 
-def create_video(target_path: str, fps: float = 30.0) -> bool:
-    """Create video with hardware-accelerated encoding and optimized settings."""
-    temp_output_path = get_temp_output_path(target_path)
-    temp_directory_path = get_temp_directory_path(target_path)
-    
-    # Determine optimal encoder based on available hardware
+def resolve_video_encoder():
+    """Return (encoder, options) for the current hardware and quality settings.
+
+    Shared by the PNG-sequence encoder (create_video) and the raw-frame
+    streaming encoder (process_video_map_in_memory) so both produce the same
+    codec/quality for a given run.
+    """
     encoder = modules.globals.video_encoder
     encoder_options = []
-    
+
     # GPU-accelerated encoding options
     if 'CUDAExecutionProvider' in modules.globals.execution_providers:
         # NVIDIA GPU encoding
@@ -152,7 +153,16 @@ def create_video(target_path: str, fps: float = 30.0) -> bool:
                 "-b:v", "0",  # Constant quality mode
                 "-cpu-used", "2",  # Speed vs quality (0-5, lower=slower/better)
             ]
-    
+    return encoder, encoder_options
+
+
+def create_video(target_path: str, fps: float = 30.0) -> bool:
+    """Create video with hardware-accelerated encoding and optimized settings."""
+    temp_output_path = get_temp_output_path(target_path)
+    temp_directory_path = get_temp_directory_path(target_path)
+
+    encoder, encoder_options = resolve_video_encoder()
+
     # Build ffmpeg command
     ffmpeg_args = [
         "-r", str(fps),

@@ -120,6 +120,15 @@ def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
     session_options.graph_optimization_level = (
         onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     )
+    # GPU-bound sessions gain nothing from extra CPU worker threads, and the
+    # default (one per core) burns CPU that the pre/post-processing still
+    # needs.  One thread each keeps the GPU stream saturated.
+    if any(
+        (p[0] if isinstance(p, tuple) else p) == "CUDAExecutionProvider"
+        for p in providers
+    ):
+        session_options.intra_op_num_threads = 1
+        session_options.inter_op_num_threads = 1
     session = onnxruntime.InferenceSession(
         model_path, sess_options=session_options, providers=providers,
     )

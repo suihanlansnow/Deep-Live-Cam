@@ -3,6 +3,7 @@ import shutil
 from typing import Any
 import insightface
 import threading
+import cv2
 
 import modules.globals
 from modules import imread_unicode, imwrite_unicode
@@ -190,6 +191,16 @@ def get_many_faces(frame: Frame) -> Any:
     except IndexError:
         return None
 
+
+def _detect_only(frame: Frame) -> tuple:
+    """Run the detection model, serializing on DirectML if needed."""
+    fa = get_face_analyser()
+    if _is_dml():
+        with modules.globals.dml_lock:
+            return fa.det_model.detect(frame, max_num=0, metric="default")
+    return fa.det_model.detect(frame, max_num=0, metric="default")
+
+
 def detect_one_face_fast(frame: Frame) -> Any:
     """Detection-only — skips landmark and recognition models.
 
@@ -197,8 +208,7 @@ def detect_one_face_fast(frame: Frame) -> Any:
     ~10ms vs ~16ms for full get_one_face() at 1080p.
     """
     from insightface.app.common import Face
-    fa = get_face_analyser()
-    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    bboxes, kpss = _detect_only(frame)
     if bboxes.shape[0] == 0:
         return None
     idx = int(bboxes[:, 0].argmin())
@@ -208,8 +218,7 @@ def detect_one_face_fast(frame: Frame) -> Any:
 def detect_many_faces_fast(frame: Frame) -> Any:
     """Detection-only multi-face — skips landmark and recognition."""
     from insightface.app.common import Face
-    fa = get_face_analyser()
-    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    bboxes, kpss = _detect_only(frame)
     if bboxes.shape[0] == 0:
         return None
     return [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
@@ -310,26 +319,37 @@ def get_unique_faces_from_target_video() -> Any:
         frame_face_embeddings = []
         face_embeddings = []
     
-        print('Creating temp resources...')
-        clean_temp(modules.globals.target_path)
-        create_temp(modules.globals.target_path)
-        print('Extracting frames...')
-        extract_frames(modules.globals.target_path)
+        target_path = modules.globals.target_path
+        print('Decoding and analysing frames in-memory...')
+        cap = cv2.VideoCapture(target_path)
+        if not cap.isOpened():
+            print(f'Could not open target video for frame analysis: {target_path}')
+            return modules.globals.source_target_map
 
-        temp_frame_paths = get_temp_frame_paths(modules.globals.target_path)
-
-        i = 0
-        for temp_frame_path in tqdm(temp_frame_paths, desc="Extracting face embeddings from frames"):
-            temp_frame = imread_unicode(temp_frame_path)
-            many_faces = get_many_faces(temp_frame)
-            if many_faces is None:
-                continue
-
-            for face in many_faces:
-                face_embeddings.append(face.normed_embedding)
-            
-            frame_face_embeddings.append({'frame': i, 'faces': many_faces, 'location': temp_frame_path})
-            i += 1
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            i = 0
+            with tqdm(total=total if total > 0 else None, desc='Extracting face embeddings from frames') as progress:
+                while True:
+                    ok, temp_frame = cap.read()
+                    if not ok:
+                        break
+                    # i is the real 0-based video frame index, incremented for
+                    # every frame so it lines up with the processing pass that
+                    # decodes the same video sequentially.
+                    many_faces = get_many_faces(temp_frame)
+                    if many_faces is not None:
+                        for face in many_faces:
+                            face_embeddings.append(face.normed_embedding)
+                        frame_face_embeddings.append({
+                            'frame': i,
+                            'frame_index': i,
+                            'faces': many_faces,
+                        })
+                    i += 1
+                    progress.update(1)
+        finally:
+            cap.release()
 
         centroids = find_cluster_centroids(face_embeddings)
 
@@ -338,16 +358,31 @@ def get_unique_faces_from_target_video() -> Any:
                 closest_centroid_index, _ = find_closest_centroid(centroids, face.normed_embedding)
                 face['target_centroid'] = closest_centroid_index
 
+        # Bucket frames per centroid in a single pass, instead of rescanning
+        # every frame once per centroid (was O(centroids x frames)). Frames
+        # with no face for a centroid are skipped: downstream consumers treat
+        # a missing frame entry exactly like an empty 'faces' list, so this
+        # also shrinks the map without changing swap behaviour.
+        buckets = [[] for _ in range(len(centroids))]
+        for frame in frame_face_embeddings:
+            by_centroid = {}
+            for face in frame['faces']:
+                by_centroid.setdefault(face['target_centroid'], []).append(face)
+            for centroid_index, faces in by_centroid.items():
+                buckets[centroid_index].append({
+                    'frame': frame['frame'],
+                    'frame_index': frame['frame_index'],
+                    'faces': faces,
+                })
+
         for i in range(len(centroids)):
             modules.globals.source_target_map.append({
-                'id' : i
+                'id' : i,
+                'target_faces_in_frame': buckets[i],
+                # O(1) lookup for the per-frame pipeline: the old lookup
+                # linearly scanned this bucket list on every frame.
+                '_frame_index': {entry['frame_index']: entry for entry in buckets[i]},
             })
-
-            temp = []
-            for frame in tqdm(frame_face_embeddings, desc=f"Mapping frame embeddings to centroids-{i}"):
-                temp.append({'frame': frame['frame'], 'faces': [face for face in frame['faces'] if face['target_centroid'] == i], 'location': frame['location']})
-
-            modules.globals.source_target_map[i]['target_faces_in_frame'] = temp
 
         # dump_faces(centroids, frame_face_embeddings)
         default_target_face()
@@ -355,7 +390,25 @@ def get_unique_faces_from_target_video() -> Any:
         return None
     
 
+def _read_video_frame(target_path: str, frame_index: int):
+    """Decode a single video frame by 0-based index.
+
+    Used to crop the default-target thumbnail without keeping every decoded
+    frame resident in memory (only a handful of best frames are sought).
+    """
+    cap = cv2.VideoCapture(target_path)
+    if not cap.isOpened():
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = cap.read()
+        return frame if ok else None
+    finally:
+        cap.release()
+
+
 def default_target_face():
+    target_path = modules.globals.target_path
     for map in modules.globals.source_target_map:
         best_face = None
         best_frame = None
@@ -375,8 +428,10 @@ def default_target_face():
                     best_frame = frame
 
         x_min, y_min, x_max, y_max = best_face['bbox']
-
-        target_frame = imread_unicode(best_frame['location'])
+        frame_index = best_frame.get('frame_index', best_frame.get('frame'))
+        target_frame = _read_video_frame(target_path, frame_index)
+        if target_frame is None:
+            continue
         map['target'] = {
                         'cv2' : target_frame[int(y_min):int(y_max), int(x_min):int(x_max)],
                         'face' : best_face
@@ -392,7 +447,7 @@ def dump_faces(centroids: Any, frame_face_embeddings: list):
         Path(temp_directory_path + f"/{i}").mkdir(parents=True, exist_ok=True)
 
         for frame in tqdm(frame_face_embeddings, desc=f"Copying faces to temp/./{i}"):
-            temp_frame = imread_unicode(frame['location'])
+            temp_frame = _read_video_frame(modules.globals.target_path, frame.get('frame_index', frame['frame']))
 
             j = 0
             for face in frame['faces']:

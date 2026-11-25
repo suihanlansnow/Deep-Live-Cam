@@ -1,5 +1,7 @@
 # Uses ONNX Runtime for GFPGAN face enhancement (no torch/gfpgan dependency)
 
+from __future__ import annotations
+
 from typing import Any, List
 import cv2
 import threading
@@ -89,9 +91,13 @@ def get_face_enhancer() -> onnxruntime.InferenceSession:
             try:
                 from modules.processors.frame._onnx_enhancer import (
                     create_onnx_session,
+                    warmup_session,
                 )
 
                 FACE_ENHANCER = create_onnx_session(model_path)
+                # Pay the cuDNN autotune / kernel-compile cost once at load
+                # instead of on the first live frame.
+                warmup_session(FACE_ENHANCER)
 
                 input_info = FACE_ENHANCER.get_inputs()[0]
                 output_info = FACE_ENHANCER.get_outputs()[0]
@@ -291,14 +297,17 @@ _enh_live_cache: dict = {
 _ENH_INTERVAL = 2  # run inference every N frames, paste cached result otherwise
 
 
-def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
+def enhance_face(temp_frame: Frame, detected_faces=None,
+                 use_temporal_cache: bool = True) -> Frame:
     """Enhances all faces in a frame using the GFPGAN ONNX model.
 
     Args:
         detected_faces: Pre-detected face list. When provided, skips
             the internal detection call (saves ~15-20ms per frame).
-            Also enables temporal caching — inference runs every
-            _ENH_INTERVAL frames, reusing the cached result otherwise.
+        use_temporal_cache: When pre-detected faces come from the live
+            preview, reuse the previous enhancement for _ENH_INTERVAL
+            frames. Video passes disable it — pasting a stale face onto
+            moving frames would smear.
     """
     session = get_face_enhancer()
 
@@ -323,7 +332,8 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
     # so reusing it in many_faces mode would paste the same face onto every
     # detected target.
     many_faces_mode = getattr(modules.globals, "many_faces", False)
-    use_cache = detected_faces is not None and not many_faces_mode
+    use_cache = (use_temporal_cache and detected_faces is not None
+                 and not many_faces_mode)
     if use_cache:
         _enh_live_cache['frame_count'] += 1
         run_inference_this_frame = (_enh_live_cache['frame_count'] % _ENH_INTERVAL == 0
@@ -391,9 +401,20 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
 
 
 def process_frame(source_face: Face | None, temp_frame: Frame,
-                   detected_faces=None) -> Frame:
-    """Processes a frame: enhances face if detected."""
-    return enhance_face(temp_frame, detected_faces=detected_faces)
+                  detected_faces=None, target_face=None) -> Frame:
+    """Processes a frame: enhances face if detected.
+
+    ``target_face`` is supplied by the video pipeline, which already ran
+    detection for the frame — using it avoids a second full analysis.
+    """
+    reuse_detection = detected_faces is None and target_face is not None
+    if reuse_detection:
+        detected_faces = [target_face]
+    return enhance_face(
+        temp_frame,
+        detected_faces=detected_faces,
+        use_temporal_cache=not reuse_detection,
+    )
 
 
 def process_frame_v2(temp_frame: Frame, detected_faces=None) -> Frame:

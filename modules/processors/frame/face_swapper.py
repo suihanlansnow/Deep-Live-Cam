@@ -11,7 +11,14 @@ import modules.processors.frame.core
 from insightface.utils import face_align
 from modules import imread_unicode, imwrite_unicode
 from modules.core import update_status
-from modules.face_analyser import get_one_face, get_many_faces, default_source_face
+from modules.face_analyser import (
+    get_one_face,
+    get_many_faces,
+    default_source_face,
+    detect_one_face_fast,
+    detect_many_faces_fast,
+    ensure_landmarks,
+)
 from modules.typing import Face, Frame
 from modules.utilities import (
     is_image,
@@ -190,8 +197,109 @@ models_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
 )
 
-def pre_check() -> bool:
-    # Use models_dir instead of abs_dir to save to the correct location
+
+# --- Accelerator capabilities -------------------------------------------------
+# GPU availability is reported by ONNX Runtime, not torch.  The models run on
+# the ONNX Runtime GPU execution provider, so gating GPU-only features on
+# `torch.cuda.is_available()` silently disabled the FP16 swap weights and CUDA
+# graph replay for anyone who installed onnxruntime-gpu without torch.
+# torch is now only used for the optional paste-back blend and as an optional
+# compute-capability probe for the FP16 decision.
+def _cuda_ep_active() -> bool:
+    """True when a CUDA execution provider is configured for this run."""
+    return any(
+        (p[0] if isinstance(p, tuple) else p) == "CUDAExecutionProvider"
+        for p in modules.globals.execution_providers
+    )
+
+
+_HAS_TORCH_CUDA = False
+_TORCH_CUDA_CAPABILITY = None
+try:
+    import torch
+
+    if torch.cuda.is_available():
+        _HAS_TORCH_CUDA = True
+        try:
+            _TORCH_CUDA_CAPABILITY = torch.cuda.get_device_capability()
+        except Exception:
+            _TORCH_CUDA_CAPABILITY = None
+except ImportError:
+    pass
+
+
+def _prefer_fp16() -> bool:
+    """Use the FP16 swap weights on CUDA.
+
+    Half the memory bandwidth of FP32 at visually identical quality.  GPUs
+    older than Turing (compute capability < 7.5, e.g. GTX 16xx) can produce
+    NaN with these weights, so they stay on FP32.  When torch is not
+    installed the capability is unknown and the model is assumed modern.
+    """
+    if not _cuda_ep_active():
+        return False
+    capability = _TORCH_CUDA_CAPABILITY
+    if capability is not None and capability < (7, 5):
+        return False
+    return True
+
+
+# TensorRT engine/timing caches live beside the models: the first run builds
+# the engine (minutes), every later run reuses it (seconds).
+TRT_CACHE_DIR = os.path.join(models_dir, "trt_cache")
+
+
+def _tensorrt_providers():
+    """Provider list with TensorRT first, or [] when it cannot be used.
+
+    TensorRT roughly halves inswapper inference time.  It needs the NVIDIA
+    runtime DLLs (registered by run.py when installed under
+    third_party/TensorRT) plus a one-off engine build.  Any missing piece
+    just means the caller keeps the CUDA path.
+    """
+    import sys
+
+    if os.environ.get("DLC_DISABLE_TENSORRT") == "1":
+        return []
+    if not _cuda_ep_active():
+        return []
+    import onnxruntime as ort
+    if "TensorrtExecutionProvider" not in ort.get_available_providers():
+        return []
+    if sys.platform == "win32":
+        import ctypes
+        for _dll in ("nvinfer_10.dll", "nvinfer_plugin_10.dll", "nvonnxparser_10.dll"):
+            try:
+                ctypes.WinDLL(_dll)
+            except OSError:
+                return []
+    try:
+        os.makedirs(TRT_CACHE_DIR, exist_ok=True)
+    except OSError:
+        return []
+    return [
+        (
+            "TensorrtExecutionProvider",
+            {
+                "device_id": 0,
+                # FP16 TensorRT builds show blotchy colour artifacts with these
+                # weights (large activations overflow fp16 accumulation); the
+                # FP32 engine matches the CUDA output within 2/255 and is still
+                # ~2x faster than CUDA EP.
+                "trt_fp16_enable": False,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": TRT_CACHE_DIR,
+                "trt_timing_cache_enable": True,
+                "trt_timing_cache_path": TRT_CACHE_DIR,
+                "trt_max_workspace_size": 1 << 30,
+            },
+        ),
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+
+
+def pre_check() -> bool:    # Use models_dir instead of abs_dir to save to the correct location
     download_directory_path = models_dir
 
     # Make sure the models directory exists, catch permission errors if they occur
@@ -204,7 +312,7 @@ def pre_check() -> bool:
     from modules.model_downloader import ensure_any
 
     variants = ["inswapper_128.onnx", "inswapper_128_fp16.onnx"]
-    if _HAS_TORCH_CUDA:
+    if _prefer_fp16():
         variants.reverse()
     if ensure_any(variants) is None:
         update_status(
@@ -242,7 +350,7 @@ def get_face_swapper() -> Any:
             # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
             fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
             fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
+            use_fp16 = _prefer_fp16() and os.path.exists(fp16_path)
             if use_fp16:
                 model_path = fp16_path
             elif os.path.exists(fp32_path):
@@ -285,17 +393,29 @@ def get_face_swapper() -> Any:
                         providers_config.append(OPENVINO_PROVIDER_CONFIG)
                     else:
                         providers_config.append(p)
-                FACE_SWAPPER = insightface.model_zoo.get_model(
-                    model_path,
-                    providers=providers_config,
-                )
-                # Set up CUDA graph session for faster inference
-                if _HAS_TORCH_CUDA and any(
-                    p == "CUDAExecutionProvider" or
-                    (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider")
-                    for p in providers_config
-                ):
-                    _init_cuda_graph_session(model_path, FACE_SWAPPER)
+                trt_config = _tensorrt_providers()
+                if trt_config:
+                    try:
+                        candidate = insightface.model_zoo.get_model(
+                            model_path,
+                            providers=trt_config,
+                        )
+                        if "TensorrtExecutionProvider" in candidate.session.get_providers():
+                            FACE_SWAPPER = candidate
+                            update_status("Face swapper running on TensorRT.", NAME)
+                    except Exception as e:
+                        print(
+                            f"[{NAME}] TensorRT init failed, falling back to CUDA: {e}",
+                            flush=True,
+                        )
+                if FACE_SWAPPER is None:
+                    FACE_SWAPPER = insightface.model_zoo.get_model(
+                        model_path,
+                        providers=providers_config,
+                    )
+                    # CUDA graph replay (CUDA EP only — not used with TensorRT).
+                    if _cuda_ep_active():
+                        _init_cuda_graph_session(model_path, FACE_SWAPPER)
                 update_status("Face swapper model loaded successfully.", NAME)
             except Exception as e:
                 update_status(f"Error loading face swapper model: {e}", NAME)
@@ -303,14 +423,6 @@ def get_face_swapper() -> Any:
                 return None
     return FACE_SWAPPER
 
-
-_HAS_TORCH_CUDA = False
-try:
-    import torch
-    if torch.cuda.is_available():
-        _HAS_TORCH_CUDA = True
-except ImportError:
-    pass
 
 # Cache for paste-back
 _paste_cache = {
@@ -377,8 +489,12 @@ class _CudaGraphSessionAdapter:
                 blob = input_dict[keys[0]]
                 latent = input_dict[keys[1]]
                 return [_cuda_graph_swap_inference(blob, latent)]
-            except Exception:
-                pass
+            except Exception as e:
+                # A failed replay would otherwise retry (and fail) on every
+                # frame with no trace. Log once and disable the graph so the
+                # rest of the run uses the plain session at full speed.
+                _cuda_graph_session['recorded'] = False
+                print(f"[{NAME}] CUDA graph replay failed, falling back to standard session: {e}")
         return self._underlying.run(output_names, input_dict, **kwargs)
 
     def __getattr__(self, name):
@@ -854,17 +970,23 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
     global PREVIOUS_FRAME_RESULT
 
     sharpness_value = getattr(modules.globals, "sharpness", 0.0)
-    enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
+    interpolation_weight = getattr(modules.globals, "interpolation_weight", 0.0)
+    interpolation_active = (
+        getattr(modules.globals, "enable_interpolation", False)
+        and 0 < interpolation_weight < 1
+    )
 
-    # Skip copy when no post-processing is active
-    if sharpness_value <= 0.0 and not enable_interpolation:
+    # Skip the full-frame copy when neither stage can change the frame.
+    # (enable_interpolation alone is not enough: it defaults to True while the
+    # weight defaults to 0, i.e. "no blending" — that used to copy every
+    # live frame for nothing.)
+    if sharpness_value <= 0.0 and not interpolation_active:
         PREVIOUS_FRAME_RESULT = None
         return current_frame
 
     processed_frame = current_frame.copy()
 
     # 1. Apply Sharpening (if enabled) with optimized kernel for Apple Silicon
-    sharpness_value = getattr(modules.globals, "sharpness", 0.0)
     if sharpness_value > 0.0 and swapped_face_bboxes:
         height, width = processed_frame.shape[:2]
         for bbox in swapped_face_bboxes:
@@ -899,12 +1021,9 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
 
 
     # 2. Apply Interpolation (if enabled)
-    enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
-    interpolation_weight = getattr(modules.globals, "interpolation_weight", 0.2)
-
     final_frame = processed_frame # Start with the current (potentially sharpened) frame
 
-    if enable_interpolation and 0 < interpolation_weight < 1:
+    if interpolation_active:
         if PREVIOUS_FRAME_RESULT is not None and PREVIOUS_FRAME_RESULT.shape == processed_frame.shape and PREVIOUS_FRAME_RESULT.dtype == processed_frame.dtype:
             # Perform interpolation
             try:
@@ -954,7 +1073,11 @@ def process_frame(source_face: Face, temp_frame: Frame, target_face: Face = None
     swapped_face_bboxes = []
 
     if modules.globals.many_faces:
-        many_faces = get_many_faces(processed_frame)
+        # Simple mode swaps every detected face with the same source, so no
+        # embeddings are involved — detection-only is enough here.
+        many_faces = detect_many_faces_fast(processed_frame)
+        if many_faces and getattr(modules.globals, "mouth_mask", False):
+            ensure_landmarks(processed_frame, many_faces)
         if many_faces:
             current_swap_target = processed_frame.copy()
             for face in many_faces:
@@ -964,7 +1087,13 @@ def process_frame(source_face: Face, temp_frame: Frame, target_face: Face = None
             processed_frame = current_swap_target
     else:
         if target_face is None:
-            target_face = get_one_face(processed_frame)
+            # The swap model only needs bbox + 5 kps, so a detection-only
+            # pass is enough.  Recognition is wasted work here (it matters
+            # only for map_faces embedding matching), and the 2d106 landmark
+            # model is only needed when mouth masking consumes it.
+            target_face = detect_one_face_fast(processed_frame)
+            if target_face is not None and getattr(modules.globals, "mouth_mask", False):
+                ensure_landmarks(processed_frame, target_face)
         if target_face:
             processed_frame = swap_face(source_face, target_face, processed_frame)
             if hasattr(target_face, "bbox") and target_face.bbox is not None:
@@ -974,7 +1103,49 @@ def process_frame(source_face: Face, temp_frame: Frame, target_face: Face = None
     return final_frame
 
 
-def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
+def _frame_entry_matches(frame_data: Any, temp_frame_path: str, frame_index: int) -> bool:
+    """Match a map entry to the frame currently being processed.
+
+    The in-memory map_faces pipeline keys entries by frame index; the legacy
+    disk pipeline keys them by the extracted PNG path.  Accept either so both
+    keep working without forcing a map rebuild.  When the disk fallback runs
+    against an in-memory-built map (which has no 'location'), derive the frame
+    index from the 1-based PNG filename -- extract_frames writes 0001.png for
+    frame 0 -- so the fallback still swaps correctly.
+    """
+    if frame_index >= 0:
+        return frame_data.get("frame_index") == frame_index
+    if not temp_frame_path:
+        return False
+    if frame_data.get("location") == temp_frame_path:
+        return True
+    if "frame_index" in frame_data:
+        import os
+        stem = os.path.splitext(os.path.basename(temp_frame_path))[0]
+        if stem.isdigit():
+            return frame_data.get("frame_index") == int(stem) - 1
+    return False
+
+
+def _frames_for_current_frame(map_data: Any, temp_frame_path: str, frame_index: int) -> List[Any]:
+    """Return the map entries that apply to the frame being processed.
+
+    In-memory map_faces runs pass a frame_index and hit the prebuilt
+    `_frame_index` dict in O(1); the legacy disk path (and any map built
+    without the index) falls back to the matching scan.
+    """
+    if frame_index >= 0:
+        index = map_data.get("_frame_index")
+        if index is not None:
+            entry = index.get(frame_index)
+            return [entry] if entry else []
+    target_frames_data = map_data.get("target_faces_in_frame", [])
+    if not target_frames_data:
+        return []
+    return [f for f in target_frames_data if f and _frame_entry_matches(f, temp_frame_path, frame_index)]
+
+
+def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "", frame_index: int = -1) -> Frame:
     """Handles complex mapping scenarios (map_faces=True) and live streams."""
     if getattr(modules.globals, "opacity", 1.0) == 0:
         # If opacity is 0, no swap happens, so no post-processing needed.
@@ -1011,9 +1182,8 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                                     source_target_pairs.append((source_face, target_face))
                         elif is_video(modules.globals.target_path):
                              # Find faces for the current frame_path in video map
-                             target_frames_data = map_data.get("target_faces_in_frame", [])
-                             if target_frames_data: # Check if frame data exists
-                                 target_frames = [f for f in target_frames_data if f and f.get("location") == temp_frame_path]
+                             target_frames = _frames_for_current_frame(map_data, temp_frame_path, frame_index)
+                             if target_frames: # Check if frame data exists
                                  for frame_data in target_frames:
                                      faces_in_frame = frame_data.get("faces", [])
                                      if faces_in_frame: # Check if faces exist
@@ -1035,9 +1205,8 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                            if target_face:
                               source_target_pairs.append((source_face, target_face))
                     elif is_video(modules.globals.target_path):
-                        target_frames_data = map_data.get("target_faces_in_frame", [])
-                        if target_frames_data:
-                           target_frames = [f for f in target_frames_data if f and f.get("location") == temp_frame_path]
+                        target_frames = _frames_for_current_frame(map_data, temp_frame_path, frame_index)
+                        if target_frames:
                            for frame_data in target_frames:
                                faces_in_frame = frame_data.get("faces", [])
                                if faces_in_frame:
@@ -1103,6 +1272,73 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
     return final_frame
 
 
+# Simple-mode source face cache.  process_frames() is called once per frame by
+# the video thread pool, so re-reading and re-analysing the source image on
+# every call wasted one image decode plus a full face analysis per frame.
+# Keyed on path + stat so a re-picked source image is picked up immediately.
+_SOURCE_FACE_CACHE: dict = {}
+_SOURCE_FACE_CACHE_LOCK = threading.Lock()
+_SOURCE_FACE_REPORTED: Optional[tuple] = None
+
+
+def _load_source_face(source_path: str) -> Any:
+    """Return the cached source face, loading it only when the file changes."""
+    global _SOURCE_FACE_REPORTED
+
+    if not source_path or not os.path.exists(source_path):
+        if _SOURCE_FACE_REPORTED != (source_path, "missing"):
+            _SOURCE_FACE_REPORTED = (source_path, "missing")
+            update_status(
+                f"Error: Source path invalid or not provided for simple mode: {source_path}",
+                NAME,
+            )
+        return None
+
+    try:
+        stat = os.stat(source_path)
+    except OSError:
+        return None
+    key = (source_path, stat.st_mtime_ns, stat.st_size)
+
+    with _SOURCE_FACE_CACHE_LOCK:
+        cached = _SOURCE_FACE_CACHE.get(key)
+    if cached is not None:
+        return cached[1]
+
+    try:
+        source_img = imread_unicode(source_path)
+        face = get_one_face(source_img) if source_img is not None else None
+    except Exception as e:
+        print(f"{NAME}: Error analysing source image {source_path}: {e}")
+        return None
+
+    if source_img is None or face is None:
+        reason = "read" if source_img is None else "no-face"
+        # Report once per (file, failure kind) instead of once per frame.
+        if _SOURCE_FACE_REPORTED != (key, reason):
+            _SOURCE_FACE_REPORTED = (key, reason)
+            if reason == "read":
+                update_status(
+                    f"Error reading source image file {source_path}. "
+                    "Please check the path and file integrity.",
+                    NAME,
+                )
+            else:
+                update_status(
+                    f"Warning: Successfully read source image {source_path}, "
+                    "but no face was detected. Swaps will be skipped.",
+                    NAME,
+                )
+        return None
+
+    with _SOURCE_FACE_CACHE_LOCK:
+        # Only the most recent source image is worth keeping resident.
+        _SOURCE_FACE_CACHE.clear()
+        _SOURCE_FACE_CACHE[key] = (key, face)
+    _SOURCE_FACE_REPORTED = None
+    return face
+
+
 def process_frames(
     source_path: str, temp_frame_paths: List[str], progress: Any = None
 ) -> None:
@@ -1118,29 +1354,7 @@ def process_frames(
 
     # --- Pre-load source face only if needed (Simple Mode: map_faces=False) ---
     if not use_v2:
-        if not source_path or not os.path.exists(source_path):
-            update_status(f"Error: Source path invalid or not provided for simple mode: {source_path}", NAME)
-            # Log the error but allow proceeding; subsequent check will stop processing.
-        else:
-            try:
-                source_img = imread_unicode(source_path)
-                if source_img is None:
-                    # Specific error for file reading failure
-                    update_status(f"Error reading source image file {source_path}. Please check the path and file integrity.", NAME)
-                else:
-                    source_face = get_one_face(source_img)
-                    if source_face is None:
-                        # Specific message for no face detected after successful read
-                        update_status(f"Warning: Successfully read source image {source_path}, but no face was detected. Swaps will be skipped.", NAME)
-                    # Free memory immediately after extracting face
-                    del source_img
-            except Exception as e:
-                # Print the specific exception caught
-                import traceback
-                print(f"{NAME}: Caught exception during source image processing for {source_path}:")
-                traceback.print_exc() # Print the full traceback
-                update_status(f"Error during source image reading or analysis {source_path}: {e}", NAME)
-                # Log general exception during the process
+        source_face = _load_source_face(source_path)
 
     total_frames = len(temp_frame_paths)
     # update_status(f"Processing {total_frames} frames. Use V2 (map_faces): {use_v2}", NAME) # Optional Debug
