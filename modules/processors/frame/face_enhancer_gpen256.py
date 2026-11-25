@@ -28,6 +28,7 @@ MODEL_MIRROR_URL = "https://github.com/harisreedhar/Face-Upscalers-ONNX/releases
 MODEL_FILE = "GPEN-BFR-256.onnx"
 
 ENHANCER = None
+_ENHANCER_MISSING_REPORTED = False   # one-shot: suppress repeat "skipped" messages
 THREAD_LOCK = threading.Lock()
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
@@ -36,30 +37,19 @@ models_dir = os.path.join(
 )
 
 
-def _obtain_model():
+def _obtain_model() -> str | None:
+    """Return the model path if present on disk, else None — never downloads."""
     from modules.model_downloader import ensure_model
 
-    model_path = ensure_model(MODEL_FILE)
-    if model_path is not None:
-        return model_path
-
-    update_status(f"Retrying {MODEL_FILE} from the mirror...", NAME)
-    from modules.utilities import conditional_download
-
-    try:
-        conditional_download(models_dir, [MODEL_MIRROR_URL])
-    except Exception as error:
-        update_status(f"Mirror download failed: {error}", NAME)
-        return None
-    fallback = os.path.join(models_dir, MODEL_FILE)
-    return fallback if os.path.exists(fallback) else None
+    return ensure_model(MODEL_FILE, download=False)
 
 
 def pre_check() -> bool:
+    """Verify the enhancer model is present — does NOT attempt network download."""
     if _obtain_model() is None:
         update_status(
-            f"Could not obtain {MODEL_FILE}. Place it in the models folder "
-            "manually or check your internet connection.",
+            f"Could not find {MODEL_FILE}. Place it in the models folder and "
+            "restart to enable face enhancement.",
             NAME,
         )
         return False
@@ -74,26 +64,37 @@ def pre_start() -> bool:
 
 
 def get_enhancer() -> Any:
-    global ENHANCER
+    """Return the ONNX enhancer session, or None when unavailable (no raise)."""
+    global ENHANCER, _ENHANCER_MISSING_REPORTED
     with THREAD_LOCK:
-        if ENHANCER is None:
-            model_path = _obtain_model()
-            if model_path is None:
-                raise FileNotFoundError(
-                    f"Model file not found: {os.path.join(models_dir, MODEL_FILE)}"
-                )
+        if ENHANCER is not None:
+            return ENHANCER
+        if _ENHANCER_MISSING_REPORTED:
+            return None
+        model_path = _obtain_model()
+        if model_path is None:
+            print(
+                f"{NAME}: {MODEL_FILE} not found locally. Enhancer will be "
+                "silently skipped.",
+                flush=True,
+            )
+            _ENHANCER_MISSING_REPORTED = True
+            return None
+        try:
             print(f"{NAME}: Loading ONNX model from {model_path}")
             ENHANCER = create_onnx_session(model_path)
             warmup_session(ENHANCER)
             print(f"{NAME}: Model loaded successfully.")
+        except Exception as e:
+            print(f"{NAME}: Failed to load enhancer: {e}", flush=True)
+            ENHANCER = None
+            _ENHANCER_MISSING_REPORTED = True
     return ENHANCER
 
 
 def enhance_face(temp_frame: Frame, face: Face) -> Frame:
-    try:
-        session = get_enhancer()
-    except Exception as e:
-        print(f"{NAME}: {e}")
+    session = get_enhancer()
+    if session is None:
         return temp_frame
     try:
         return enhance_face_onnx(temp_frame, face, session, INPUT_SIZE)

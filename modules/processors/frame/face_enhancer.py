@@ -22,6 +22,7 @@ from modules.utilities import (
 )
 
 FACE_ENHANCER = None
+_FACE_ENHANCER_MISSING_REPORTED = False   # one-shot: suppress repeat "skipped" messages
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-ENHANCER"
@@ -47,12 +48,20 @@ FFHQ_TEMPLATE_512 = np.array(
 
 
 def pre_check() -> bool:
+    """Verify the enhancer model is present on disk — do NOT download here.
+
+    This runs in the UI's main thread.  A network download would freeze the
+    whole window for minutes, so we only check locally.  When the file is
+    missing we return False; the caller logs a message and the enhancer is
+    silently skipped in the live pipeline.  The operator can drop the model
+    into the models folder and restart.
+    """
     from modules.model_downloader import ensure_model
 
-    if ensure_model(MODEL_FILE) is None:
+    if ensure_model(MODEL_FILE, download=False) is None:
         update_status(
-            f"Could not obtain {MODEL_FILE}. Place it in the models folder "
-            "manually or check your internet connection.",
+            f"Could not find {MODEL_FILE}. Place it in the models folder and "
+            "restart to enable face enhancement.",
             NAME,
         )
         return False
@@ -69,65 +78,68 @@ def pre_start() -> bool:
 
 
 def get_face_enhancer() -> onnxruntime.InferenceSession:
+    """Return the GFPGAN ONNX Runtime session, or None when unavailable.
+
+    Unlike the original version this does NOT raise when the model is missing
+    or cannot be loaded.  Callers (especially the live webcam worker thread)
+    must tolerate None and skip enhancement rather than crash the Qt event
+    loop.  We print one clear diagnostic so the operator knows why the
+    enhancer was silently skipped.
     """
-    Initializes and returns the GFPGAN ONNX Runtime inference session,
-    using the execution providers configured in modules.globals.
-    """
-    global FACE_ENHANCER
+    global FACE_ENHANCER, _FACE_ENHANCER_MISSING_REPORTED
 
     with THREAD_LOCK:
-        if FACE_ENHANCER is None:
-            from modules.model_downloader import ensure_model
+        if FACE_ENHANCER is not None:
+            return FACE_ENHANCER
+        if _FACE_ENHANCER_MISSING_REPORTED:
+            return None
 
-            model_path = ensure_model(MODEL_FILE)
+        from modules.model_downloader import ensure_model
 
-            if model_path is None:
-                raise FileNotFoundError(
-                    f"{NAME}: Model not found at "
-                    f"{os.path.join(models_dir, MODEL_FILE)} and could not be "
-                    "downloaded"
-                )
+        model_path = ensure_model(MODEL_FILE, download=False)
+        if model_path is None:
+            print(
+                f"{NAME}: {MODEL_FILE} not found locally. Face enhancer will be "
+                "silently skipped.  Place the file in the models folder and "
+                "restart the program to enable it.",
+                flush=True,
+            )
+            _FACE_ENHANCER_MISSING_REPORTED = True
+            return None
 
-            try:
-                from modules.processors.frame._onnx_enhancer import (
-                    create_onnx_session,
-                    warmup_session,
-                )
+        try:
+            from modules.processors.frame._onnx_enhancer import (
+                create_onnx_session,
+                warmup_session,
+            )
 
-                FACE_ENHANCER = create_onnx_session(model_path)
-                # Pay the cuDNN autotune / kernel-compile cost once at load
-                # instead of on the first live frame.
-                warmup_session(FACE_ENHANCER)
+            FACE_ENHANCER = create_onnx_session(model_path)
+            warmup_session(FACE_ENHANCER)
 
-                input_info = FACE_ENHANCER.get_inputs()[0]
-                output_info = FACE_ENHANCER.get_outputs()[0]
-                active_providers = FACE_ENHANCER.get_providers()
-                print(
-                    f"{NAME}: GFPGAN ONNX model loaded successfully."
-                )
-                print(
-                    f"{NAME}: Input: {input_info.name}, "
-                    f"shape: {input_info.shape}, type: {input_info.type}"
-                )
-                print(
-                    f"{NAME}: Output: {output_info.name}, "
-                    f"shape: {output_info.shape}, type: {output_info.type}"
-                )
-                print(f"{NAME}: Active providers: {active_providers}")
+            input_info = FACE_ENHANCER.get_inputs()[0]
+            output_info = FACE_ENHANCER.get_outputs()[0]
+            active_providers = FACE_ENHANCER.get_providers()
+            print(f"{NAME}: GFPGAN ONNX model loaded successfully.")
+            print(
+                f"{NAME}: Input: {input_info.name}, "
+                f"shape: {input_info.shape}, type: {input_info.type}"
+            )
+            print(
+                f"{NAME}: Output: {output_info.name}, "
+                f"shape: {output_info.shape}, type: {output_info.type}"
+            )
+            print(f"{NAME}: Active providers: {active_providers}")
+            return FACE_ENHANCER
 
-            except Exception as e:
-                print(f"{NAME}: Error loading GFPGAN ONNX model: {e}")
-                FACE_ENHANCER = None
-                raise RuntimeError(
-                    f"{NAME}: Failed to load GFPGAN ONNX model: {e}"
-                )
-
-    if FACE_ENHANCER is None:
-        raise RuntimeError(
-            f"{NAME}: Failed to initialize GFPGAN ONNX session. Check logs."
-        )
-
-    return FACE_ENHANCER
+        except Exception as e:
+            print(
+                f"{NAME}: Error loading GFPGAN ONNX model: {e}. "
+                "Face enhancer will be silently skipped.",
+                flush=True,
+            )
+            FACE_ENHANCER = None
+            _FACE_ENHANCER_MISSING_REPORTED = True
+            return None
 
 
 def _align_face(
@@ -310,6 +322,10 @@ def enhance_face(temp_frame: Frame, detected_faces=None,
             moving frames would smear.
     """
     session = get_face_enhancer()
+    if session is None:
+        # Model missing or failed to load — caller must tolerate the no-op.
+        # The one-time diagnostic was already printed in get_face_enhancer.
+        return temp_frame
 
     # Determine model input resolution from the session metadata
     input_info = session.get_inputs()[0]

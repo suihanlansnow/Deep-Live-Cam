@@ -148,14 +148,24 @@ def _download(name: str, url: str, target: str, size: Optional[int]) -> bool:
 
 
 def ensure_model(
-    name: str, quiet: bool = False, dest_dir: Optional[str] = None
+    name: str, quiet: bool = False, dest_dir: Optional[str] = None,
+    download: bool = True,
 ) -> Optional[str]:
+    """Return the local path of ``name`` once it is guaranteed to exist.
+
+    ``download=False`` only checks for a file on disk — it will NOT attempt
+    to fetch from the network.  This is required for call sites that live
+    inside a time-sensitive thread (e.g. the live webcam worker), because a
+    slow download would otherwise stall the pipeline and hang the UI.
+    """
     name = name.replace(os.sep, "/")
     target = local_path(name, dest_dir)
 
     with _lock_for(target):
         if is_present(name, dest_dir):
             return target
+        if not download:
+            return None
         if not quiet:
             print(f"[DLC.MODELS] {name} not found in models folder, downloading...")
         if _download(name, resolve_url(name), target, expected_size(name)):
