@@ -30,6 +30,16 @@ By using this software, you agree to these terms and commit to using it in a man
 
 Users are expected to use this software responsibly and legally. If using a real person's face, obtain their consent and clearly label any output as a deepfake when sharing online. We are not responsible for end-user actions.
 
+## 项目目的 · What this project is for
+
+本项目是一次对 [Deep-Live-Cam](https://github.com/hacksider/Deep-Live-Cam) 的**工程化改造与性能优化**。原版代码以 CPU 运行为主，在 Windows + NVIDIA GPU 环境下 onnxruntime-gpu 常常因为 cuDNN / CUDA 运行时缺失而**静默回退到 CPU**，导致实时摄像头换脸实际只有 0.5–1 fps。我们的目标是**保证实时摄像头模式稳定 ≥ 20 fps**，并对视频离线管线做同量级的吞吐提升。
+
+> 原版功能保留不变：UI live 摄像头、CLI 视频/图片换脸、map_faces 多脸映射、mouth mask、poisson blend 等。所有优化都是**可选的运行时增强**——缺失 TensorRT 或缺少 cuDNN 时自动回退到 CUDA graph / CPU，不增加运行时依赖的强约束。
+
+This fork is an engineering pass and performance overhaul of [Deep-Live-Cam](https://github.com/hacksider/Deep-Live-Cam). The upstream code was tuned around a CPU baseline; on Windows + NVIDIA, onnxruntime-gpu would silently fall back to CPU whenever a cuDNN / CUDA runtime DLL was missing, dropping live webcam swap to ~0.5 fps. Our deliverable is a **20 fps guarantee for the live webcam path** and comparable throughput gains for the offline video pipeline.
+
+> Every upstream feature is preserved: UI live webcam, CLI image/video swap, map_faces multi-face mapping, mouth mask, poisson blend, and so on. All new optimizations are **opt-in runtime enhancements** — if TensorRT or cuDNN are absent, the code falls back to CUDA graph replay or plain CPU. No hard new runtime dependencies were introduced.
+
 ## Pre-built Deep-Live-Cam 2.8 Ultimate!
 
 <p align="center">
@@ -127,6 +137,96 @@ Perfect if you want the fastest setup with **zero manual installation**, pre-con
 <p align="center">
   <video src="https://github.com/user-attachments/assets/2e9b9b82-fa04-4b70-9f56-b1f68e7672d0" width="450" controls></video>
 </p>
+
+## 性能优化 · Performance optimizations
+
+> 全部在 RTX 3070 8GB / Windows 10 / Python 3.9 上实测。live 循环每 2 帧检测一次人脸（30 fps 摄像头），swap 每帧执行一次。基准为 CPU EP、运行时依赖齐全、TensorRT 已缓存引擎。
+
+> All numbers measured on an RTX 3070 8GB / Windows 10 / Python 3.9. The live loop runs face detection every 2 frames on a 30 fps webcam, swap every frame. Baseline uses the CPU EP; runtime deps are fully installed; TensorRT engine is from cache.
+
+| 路径 / Path | CPU-only | CUDA graph | TensorRT FP32 |
+|---|---|---|---|
+| 实时摄像头 live · 640×480 | **0.6 fps** · swap 1500 ms | **27.5 fps** · swap 19 ms | **29.9 fps** · swap 10 ms |
+| 实时摄像头 live · 1280×720 | ~0.4 fps | 20.1 fps | **26.9 fps** |
+| map_faces 视频管线 · 1080p / 5 min | 吞吐低、磁盘 I/O 重 | 消除 PNG 往返、同趟混音 | 引擎缓存命中后秒级加载 |
+
+### 1. 修复：CUDA 执行器加载失败（根因） · CUDA EP restoration
+
+原版 `run.py` 只注册了 pip `nvidia-*` wheels 里的 DLL 目录。当用户只装了 CUDA Toolkit 而没装 pip wheel 时（或反过来），onnxruntime-gpu **静默**回退到 CPU，无任何警告——这是"live 卡死"的直接原因。
+
+- `run.py` 在启动时同时注册：`sys.prefix/Lib/site-packages/nvidia/*/bin`、`torch/lib`、`%CUDA_PATH%/bin` 兜底，并对每个目录执行 `PATH` 前置 + `os.add_dll_directory()`（Python 3.8+ 扩展模块依赖需后者）。
+- `requirements.txt` 声明 `nvidia-cudnn-cu12>=9.1,<10`（Windows），避免重装环境后再次静默回退。
+- 验证标准：启动日志中应出现 `Applied providers: ['CUDAExecutionProvider', ...]`。
+
+**Fix: the upstream `run.py` only registered DLL directories from pip `nvidia-*` wheels.** Users with only the CUDA Toolkit installed (or vice versa) got a **silent** CPU fallback — the direct cause of "live is painfully slow".
+
+- `run.py` now registers, at startup: `sys.prefix/Lib/site-packages/nvidia/*/bin`, `torch/lib`, and `%CUDA_PATH%/bin` as a fallback, with both `PATH` prepend and `os.add_dll_directory()` (required by Python ≥3.8 for extension-module native deps).
+- `requirements.txt` pins `nvidia-cudnn-cu12>=9.1,<10` on Windows, so a fresh environment won't silently drop to CPU.
+- Smoke check: the startup log should print `Applied providers: ['CUDAExecutionProvider', ...]`.
+
+### 2. map_faces 流式编码 · Streaming encoder for map_faces
+
+原版离线管线在预处理阶段把每一帧写成 PNG 到磁盘，再在处理阶段逐帧读回做换脸——整段 I/O 是瓶颈。
+
+**三项改动 / Three changes:**
+
+A. **零 PNG 直写 ffmpeg stdin** — 预处理阶段直接 `cv2.imencode('.jpg', frame)` → `ffmpeg -i pipe:0 -c:v libx264`，不经过磁盘。
+B. **编码同趟混音** — 把换脸后的裸视频流和原始音频**一次性**交给 ffmpeg `ffmpeg -i pipe:0 -i audio.mp3 -c:v copy -c:a aac -map 0:v -map 1:a out.mp4`，避免先写无音频文件再 mux。
+C. **帧索引 O(1)** — `target_faces_in_frame` 用 `{frame_index: [...faces...]}` 字典查找，替代按文件名字符串排序后 O(N) 扫描。
+
+### 3. TensorRT FP32 执行器 · TensorRT FP32 EP
+
+inswapper 是一个 1×3×128×128 → 1×3×128×128 的 U-Net 结构，完全静态 shape，恰好是 TensorRT 最擅长的场景。
+
+**为什么选 FP32 而不是 FP16？** 先用 FP16 引擎试跑了——推理虽快，但输出出现**明显的红斑块状伪影**（最大像素差 64/255 vs CUDA），原因是该模型部分层激活溢出 fp16 累加器。FP32 引擎输出与 CUDA 最大差 2/255、平均差 0.22，肉眼无差异，且仍有约 2 倍加速（19 ms → 10 ms）。
+
+- 运行时：`run.py` 注册 `third_party/TensorRT/bin`（或 `TENSORRT_PATH` 环境变量）。
+- 代码：`modules/processors/frame/face_swapper.py` 新增 `_tensorrt_providers()`，DLL 齐全时 TRT 优先、CUDA 次之、CPU 兜底；任何环节失败自动回退。
+- 缓存：引擎和 timing cache 放在 `models/trt_cache/`。首次启动构建引擎 ~60 秒（RTX 3070）；后续命中缓存 ~4 秒。
+- 回退开关：`DLC_DISABLE_TENSORRT=1` 强制走 CUDA graph 回放。
+- 注意：引擎是 **sm86 (RTX 30xx)** 特定的。换 GPU/换算力架构后首次启动会重建。
+
+> `third_party/TensorRT/bin`（~1.2 GB）和 `models/trt_cache`（~265 MB）默认 `.gitignore`，需要自己下载/生成。
+
+**Why FP32 and not FP16?** The FP16 engine produced visible blotchy colour artifacts (max pixel diff 64/255 vs CUDA) because certain layer activations overflow the fp16 accumulator. FP32 matches CUDA within 2/255 (mean 0.22) and is still ~2× faster (19 ms → 10 ms per swap).
+
+- Runtime: `run.py` registers `third_party/TensorRT/bin` (or `TENSORRT_PATH` env var).
+- Code: `modules/processors/frame/face_swapper.py` adds `_tensorrt_providers()` that puts TRT first, CUDA second, CPU last; each layer is independent so any missing piece causes a transparent fallback.
+- Caching: engine + timing cache under `models/trt_cache/`. First launch builds the engine (~60 s on RTX 3070); subsequent launches load from cache (~4 s).
+- Escape hatch: set `DLC_DISABLE_TENSORRT=1` to force CUDA graph replay.
+- Caveat: the engine is **sm86 (RTX 30xx)** specific — a different GPU / compute capability will trigger a rebuild on first run.
+
+> `third_party/TensorRT/bin` (~1.2 GB) and `models/trt_cache` (~265 MB) are `.gitignore`d by default — download/generate them locally.
+
+### 4. CUDA graph session · CUDA graph replay
+
+当 TensorRT 不可用时（例如没装运行时 DLL），`_init_cuda_graph_session()` 会在启动时用 `enable_cuda_graph: '1'` 创建一个带 CUDA graph 的 ORT session，并预先分配好输入输出的 GPU buffer（inswapper 静态 1×3×128×128 + 1×512）。每帧推理变成一次 `update_inplace + run_with_iobinding`，省去了每次 kernel launch 的 CPU 同步开销。CUDA graph 与 TensorRT **互斥**——TensorRT EP 自带 graph 级优化，再叠一层 ORT 级的 graph replay 不会更快。
+
+### 5. Live 检测频率 · Live detection cadence
+
+`WebcamPreviewWindow` 的 worker 用 `det_interval = max(1, round(self._fps * 0.08))` 决定每隔多少帧检测一次人脸。30 fps 摄像头 → 每 2 帧检测一次，swap 每帧执行。这既减少了检测开销（buffalo_l 的 det_model 约 24 ms/次），又避免每帧都重算仿射变换导致贴回位置抖动。
+
+### 回退优先级 · Fallback precedence
+
+```
+TensorRT FP32 (引擎缓存命中)
+  ↓ 缺失 DLL / 引擎构建失败
+CUDA graph replay (enable_cuda_graph + 预分配 GPU buffer)
+  ↓ CUDA EP 不可用
+Plain CUDA EP (无 graph)
+  ↓
+CPU EP (兜底)
+```
+
+```
+TensorRT FP32 (engine cache hit)
+  ↓ DLL missing / engine build fails
+CUDA graph replay (enable_cuda_graph + pre-allocated GPU buffers)
+  ↓ CUDA EP unavailable
+Plain CUDA EP (no graph)
+  ↓
+CPU EP (last resort)
+```
 
 ## Installation (Manual)
 
